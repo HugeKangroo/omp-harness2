@@ -1,0 +1,22 @@
+{
+  "name": "omp-harness2",
+  "version": "0.1.0-alpha.1",
+  "description": "Evidence-driven harness optimization for Oh My Pi",
+  "type": "module",
+  "private": true,
+  "engines": { "bun": ">=1.4.0" },
+  "omp": { "extensions": ["./src/extension.ts"] },
+  "bin": { "omp-harness2": "./src/cli.ts" },
+  "files": ["src", "README.md", "docs", "LICENSE", "NOTICE"],
+  "scripts": {
+    "test": "bun test",
+    "check": "bun run typecheck && bun test",
+    "typecheck": "bun x tsc --noEmit",
+    "doctor": "bun src/cli.ts doctor",
+    "dev": "bun src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
+}
