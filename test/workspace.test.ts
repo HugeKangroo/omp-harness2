@@ -1,0 +1,152 @@
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { spawnSync } from "node:child_process";
+import { applyWorkspace, captureSnapshot, diffWorkspace, materializeSnapshot, recoverInterruptedApplies, WORKSPACE_LIMITS } from "../src/workspace.js";
+
+const temporary: string[] = [];
+afterEach(() => { for (const root of temporary.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+function put(root: string, file: string, value: string): void { fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true }); fs.writeFileSync(path.join(root, file), value); }
+function git(root: string, ...args: string[]): void {
+  const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error(result.stderr);
+}
+function fixture(): { root: string; source: string; snapshotRoot: string; candidate: string } {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-harness2-workspace-")));
+  temporary.push(root);
+  const source = path.join(root, "source"); fs.mkdirSync(source); git(source, "init", "-q");
+  put(source, "file.txt", "original"); git(source, "add", "file.txt");
+  return { root, source, snapshotRoot: path.join(root, "snapshot"), candidate: path.join(root, "candidate") };
+}
+
+describe("workspace snapshots", () => {
+  test("captures dirty and untracked bytes, excludes ignored files and explicit ambient/secret paths", () => {
+    const f = fixture();
+    put(f.source, "file.txt", "dirty"); put(f.source, "new.txt", "untracked");
+    put(f.source, ".gitignore", "ignored.txt\nnode_modules/\n"); put(f.source, "ignored.txt", "not part of task");
+    put(f.source, ".env", "do not copy"); put(f.source, ".omp/settings.json", "{}"); put(f.source, "AGENTS.md", "ambient instructions");
+    put(f.source, ".harness-evidence/user-file.txt", "reserved evidence namespace");
+    const snapshot = captureSnapshot(f.source, f.snapshotRoot);
+    expect(snapshot.files.map(file => file.path)).toEqual([".gitignore", "file.txt", "new.txt"]);
+    expect(snapshot.excludedPaths).toEqual([".env", ".harness-evidence/user-file.txt", ".omp/settings.json", "AGENTS.md"]);
+    expect(fs.readFileSync(path.join(f.snapshotRoot, "file.txt"), "utf8")).toBe("dirty");
+    expect(fs.existsSync(path.join(f.snapshotRoot, ".env"))).toBe(false);
+  });
+  test("preserves dirty deletions and executable permission changes", () => {
+    const f = fixture(); put(f.source, "run.sh", "echo hello"); git(f.source, "add", "run.sh");
+    fs.unlinkSync(path.join(f.source, "file.txt")); fs.chmodSync(path.join(f.source, "run.sh"), 0o755);
+    const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    expect(snapshot.files.map(e => e.path)).toEqual(["run.sh"]);
+    fs.chmodSync(path.join(f.candidate, "run.sh"), 0o644);
+    const changes = diffWorkspace(snapshot, f.candidate);
+    expect(changes[0]?.kind).toBe("modify"); expect(changes[0]?.beforeHash).not.toBe(changes[0]?.afterHash);
+  });
+  test("rejects a non-Git root, symlink input and oversized file", () => {
+    const f = fixture(); expect(() => captureSnapshot(f.root, path.join(f.root, ".harness2/snapshot"))).toThrow("Git");
+    fs.symlinkSync("file.txt", path.join(f.source, "linked"));
+    expect(() => captureSnapshot(f.source, f.snapshotRoot)).toThrow("Symlink"); fs.unlinkSync(path.join(f.source, "linked"));
+    const fd = fs.openSync(path.join(f.source, "large.bin"), "w"); fs.ftruncateSync(fd, WORKSPACE_LIMITS.fileBytes + 1); fs.closeSync(fd);
+    expect(() => captureSnapshot(f.source, f.snapshotRoot)).toThrow("size limit");
+  });
+  test("materializes a fixed start and resets only an owned candidate directory", () => {
+    const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot);
+    materializeSnapshot(snapshot, f.candidate); put(f.candidate, "file.txt", "changed"); put(f.candidate, "extra.txt", "extra");
+    materializeSnapshot(snapshot, f.candidate);
+    expect(fs.readFileSync(path.join(f.candidate, "file.txt"), "utf8")).toBe("original");
+    expect(fs.existsSync(path.join(f.candidate, "extra.txt"))).toBe(false);
+    const unowned = path.join(f.root, "unowned"); put(unowned, "keep", "user file");
+    expect(() => materializeSnapshot(snapshot, unowned)).toThrow();
+    expect(fs.readFileSync(path.join(unowned, "keep"), "utf8")).toBe("user file");
+  });
+  test("rejects tampered snapshots and path escapes", () => {
+    const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot);
+    put(f.snapshotRoot, "file.txt", "tampered"); expect(() => materializeSnapshot(snapshot, f.candidate)).toThrow("integrity");
+    snapshot.files[0]!.path = "../source/file.txt"; expect(() => materializeSnapshot(snapshot, f.candidate)).toThrow("Unsafe");
+  });
+  test("rejects input drift during capture rather than retaining a mixed snapshot", () => {
+    const f = fixture(); const original = fs.writeFileSync;
+    const mocked = spyOn(fs, "writeFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions) => {
+      original(file, data, options);
+      if (String(file) === path.join(f.snapshotRoot, "file.txt")) original(path.join(f.source, "file.txt"), "concurrent edit");
+    }) as typeof fs.writeFileSync);
+    try { expect(() => captureSnapshot(f.source, f.snapshotRoot)).toThrow("changed during snapshot"); }
+    finally { mocked.mockRestore(); }
+    expect(fs.existsSync(f.snapshotRoot)).toBe(false);
+  });
+});
+
+describe("workspace apply", () => {
+  test("previews and applies add/modify/delete, preserves unrelated files, and is idempotent", () => {
+    const f = fixture(); put(f.source, "delete.txt", "delete me");
+    const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    put(f.candidate, "file.txt", "new value"); put(f.candidate, "nested/new.txt", "added"); fs.unlinkSync(path.join(f.candidate, "delete.txt"));
+    put(f.source, "unrelated.txt", "keep me");
+    const preview = applyWorkspace(snapshot, f.candidate, { dryRun: true });
+    expect(preview.changes.map(c => [c.path, c.kind])).toEqual([["delete.txt", "delete"], ["file.txt", "modify"], ["nested/new.txt", "add"]]);
+    expect(preview.applied).toBe(false); expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("original");
+    expect(applyWorkspace(snapshot, f.candidate).applied).toBe(true);
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("new value");
+    expect(fs.readFileSync(path.join(f.source, "unrelated.txt"), "utf8")).toBe("keep me");
+    expect(fs.existsSync(path.join(f.source, "delete.txt"))).toBe(false);
+    expect(applyWorkspace(snapshot, f.candidate)).toMatchObject({ applied: false, alreadyApplied: true });
+  });
+  test("rejects drift even in unchanged snapshot files before writing anything", () => {
+    const f = fixture(); put(f.source, "other.txt", "before");
+    const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    put(f.candidate, "file.txt", "candidate"); put(f.source, "other.txt", "user edit");
+    expect(() => applyWorkspace(snapshot, f.candidate)).toThrow("drift");
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("original");
+  });
+  test("rejects conflicting new files and symlink parents in the target", () => {
+    const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    put(f.candidate, "new.txt", "candidate"); put(f.source, "new.txt", "user edit");
+    expect(() => applyWorkspace(snapshot, f.candidate)).toThrow("drift");
+    fs.unlinkSync(path.join(f.source, "new.txt")); fs.unlinkSync(path.join(f.candidate, "new.txt"));
+    put(f.candidate, "nested/new.txt", "candidate"); const outside = path.join(f.root, "outside"); fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(f.source, "nested"));
+    expect(() => applyWorkspace(snapshot, f.candidate)).toThrow("Symlink"); expect(fs.readdirSync(outside)).toEqual([]);
+  });
+  test("rejects candidate secrets, metadata, ambient instructions and symlinks", () => {
+    for (const forbidden of [".env", ".git/config", ".GIT/config", ".omp/settings.json", ".harness-evidence/forged.json", "AGENTS.md", "secret.json"]) {
+      const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate); put(f.candidate, forbidden, "bad");
+      expect(() => diffWorkspace(snapshot, f.candidate)).toThrow("protected");
+    }
+    const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    fs.symlinkSync("file.txt", path.join(f.candidate, "symlink")); expect(() => diffWorkspace(snapshot, f.candidate)).toThrow("symlink");
+  });
+  test("rolls back completed file writes when a later candidate changes during apply", () => {
+    const f = fixture(); put(f.source, "z.txt", "old z");
+    const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    put(f.candidate, "file.txt", "new"); put(f.candidate, "z.txt", "new z");
+    const original = fs.renameSync;
+    const mocked = spyOn(fs, "renameSync").mockImplementation((oldPath, newPath) => {
+      original(oldPath, newPath);
+      if (String(newPath) === path.join(f.source, "file.txt")) put(f.candidate, "z.txt", "changed after preview");
+    });
+    try { expect(() => applyWorkspace(snapshot, f.candidate)).toThrow("prior file contents restored"); }
+    finally { mocked.mockRestore(); }
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("original");
+    expect(fs.readFileSync(path.join(f.source, "z.txt"), "utf8")).toBe("old z");
+  });
+  test("recovers an interrupted multi-file apply from backups", () => {
+    const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    put(f.candidate, "file.txt", "new"); put(f.candidate, "new.txt", "new file");
+    const changes = diffWorkspace(snapshot, f.candidate);
+    const directory = path.join(f.source, ".harness2/apply-transactions/interrupted");
+    put(directory, "backup/0", "original");
+    put(directory, "journal.json", JSON.stringify({ sourceRoot: f.source, state: "applying", changes, before: [snapshot.files[0], null] }));
+    put(f.source, "file.txt", "new"); put(f.source, "new.txt", "new file");
+    expect(recoverInterruptedApplies(f.source)).toEqual(["interrupted"]);
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("original"); expect(fs.existsSync(path.join(f.source, "new.txt"))).toBe(false);
+    expect(recoverInterruptedApplies(f.source)).toEqual([]);
+  });
+  test("recovery refuses to overwrite subsequent user edits", () => {
+    const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate); put(f.candidate, "file.txt", "new");
+    const directory = path.join(f.source, ".harness2/apply-transactions/interrupted"); put(directory, "backup/0", "original");
+    put(directory, "journal.json", JSON.stringify({ sourceRoot: f.source, state: "applying", changes: diffWorkspace(snapshot, f.candidate), before: [snapshot.files[0]] }));
+    put(f.source, "file.txt", "post-crash user edit");
+    expect(() => recoverInterruptedApplies(f.source)).toThrow("workspace changed");
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("post-crash user edit");
+  });
+});
