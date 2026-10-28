@@ -1,17 +1,43 @@
 import { describe, expect, test } from "bun:test";
-import { parseCommand, parseCommandText, safeDisplay, tokenizeCommand } from "../src/commands.ts";
+import { formatShow, formatStatus, parseCommand, parseCommandText, safeDisplay, tokenizeCommand } from "../src/commands.ts";
 import { renderDiff } from "../src/diff.ts";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunRecord } from "../src/types.ts";
-import harnessExtension from "../src/extension.ts";
+import harnessExtension, { runArguments } from "../src/extension.ts";
+import { runConfig } from "../src/cli.ts";
 
 describe("command parsing", () => {
   test("accepts natural task text and typed options", () => {
     expect(parseCommandText('run 修复缓存 并添加测试 --budget 4.5 --model provider/model --domain "TypeScript concurrency"')).toEqual({
       kind: "run", task: "修复缓存 并添加测试", options: { budget: 4.5, model: "provider/model", domain: "TypeScript concurrency" },
     });
+  });
+
+  test("strategy remains optional and research only accepts the legacy override", () => {
+    expect(parseCommandText("run 写一份简洁的项目说明")).toEqual({ kind: "run", task: "写一份简洁的项目说明", options: {} });
+    for (const strategy of ["auto", "direct", "explore", "legacy"] as const) {
+      expect(parseCommandText(`run compare approaches --strategy=${strategy}`)).toEqual({ kind: "run", task: "compare approaches", options: { strategy } });
+    }
+    expect(() => parseCommandText("run task --strategy parallel")).toThrow("--strategy must be");
+    expect(() => parseCommandText("run task --strategy direct --strategy explore")).toThrow("Duplicate");
+    expect(parseCommandText("run task --mode research")).toEqual({ kind: "run", task: "task", options: { mode: "research" } });
+    expect(parseCommandText("run task --strategy legacy --mode research").kind).toBe("run");
+    for (const strategy of ["auto", "direct", "explore"]) expect(() => parseCommandText(`run task --strategy ${strategy} --mode research`)).toThrow("Research mode requires");
+    expect(parseCommandText("run -- --strategy explore")).toEqual({ kind: "run", task: "--strategy explore", options: {} });
+  });
+
+  test("OMP forwards strategy and literal task text through CLI configuration", () => {
+    const command = parseCommand(["run", "--strategy", "explore", "--budget", "2.5", "--", "Compare drafts; keep --strategy literal"]);
+    if (command.kind !== "run") throw new Error("Expected run command");
+    const args = runArguments(command, { model: { provider: "test", id: "model" } });
+    expect(args[0]).toBe("start");
+    const forwarded = parseCommand(["run", ...args.slice(1)]);
+    if (forwarded.kind !== "run") throw new Error("Expected forwarded run command");
+    expect(forwarded.task).toBe(command.task);
+    expect(runConfig(forwarded.options)).toMatchObject({ model: "test/model", strategy: "explore", maxCostUsd: 2.5 });
+    expect(runConfig({ model: "test/model" })).not.toHaveProperty("strategy");
   });
 
   test("preserves shell syntax as inert task text", () => {
@@ -69,6 +95,60 @@ function diffFixture(callback: (record: RunRecord, before: string, after: string
   try { callback(record, before, after); }
   finally { rmSync(directory, { recursive: true, force: true }); }
 }
+
+describe("task progress and inspection", () => {
+  test("shows routing, named results, unknown evidence and review limitations", () => diffFixture((record) => {
+    record.config.strategy = "auto";
+    record.winner = "route_2";
+    record.selectionReason = "The concise draft satisfies the requested structure.";
+    record.exploration = {
+      plan: {
+        decision: "explore", reason: "Two writing approaches have different tradeoffs.",
+        criteria: [{ id: "clarity", description: "Make the decision easy to understand", kind: "quality" }],
+        routes: [
+          { id: "route_1", name: "Detailed explanation", approach: "Explain each step", assumptions: ["Readers need background"], tradeoffs: ["Longer text"] },
+          { id: "route_2", name: "Concise draft", approach: "Lead with the decision", assumptions: [], tradeoffs: ["Less background"] },
+        ],
+      },
+      selection: {
+        method: "model_review", winner: "route_2", reason: record.selectionReason,
+        limitations: ["Reader comprehension has not been measured."],
+        assessments: [{ candidate: "route_2", criteria: [{ criterionId: "clarity", verdict: "unknown", evidence: "No reader study is available." }], strengths: ["Clear opening"], weaknesses: ["Limited background"] }],
+      },
+    };
+    const status = formatStatus(record);
+    expect(status).toContain("Strategy: auto");
+    expect(status).toContain("Two writing approaches have different tradeoffs.");
+    expect(status).toContain("Routes: Detailed explanation; Concise draft");
+    expect(status).toContain("Selected result: Concise draft");
+    expect(status).toContain("Evaluation: model review");
+    expect(status).toContain("no executed tests or performance measurements");
+    expect(status).toContain("Unknown: 1 criterion assessments remain unverified.");
+    expect(status).toContain("Reader comprehension has not been measured.");
+    expect(status).toContain(record.selectionReason);
+    const show = formatShow(record);
+    expect(show).toContain("clarity [quality]: Make the decision easy to understand");
+    expect(show).toContain("Approach: Lead with the decision");
+    expect(show).toContain("Assumptions: Readers need background");
+    expect(show).toContain("Tradeoffs: Less background");
+    expect(show).toContain("clarity: unknown — No reader study is available.");
+  }));
+
+  test("distinguishes explicit fallback and preserves inspection of legacy records", () => diffFixture((record) => {
+    expect(formatStatus(record)).toContain("Strategy: legacy");
+    record.exploration = {
+      plan: { decision: "direct", reason: "The edit has one clear implementation.", criteria: [], routes: [] },
+      selection: { method: "fallback", assessments: [], winner: "baseline", reason: "Model comparison was unavailable; retained the completed baseline.", limitations: ["Quality was not established by evaluation."] },
+    };
+    record.winner = "baseline";
+    const status = formatStatus(record);
+    expect(status).toContain("Approach: direct");
+    expect(status).toContain("Evaluation: fallback (no validated model comparison)");
+    expect(status).toContain("retained the completed baseline");
+    expect(status).toContain("Quality was not established by evaluation.");
+    expect(status).not.toContain("Routes:");
+  }));
+});
 
 describe("review diff", () => {
   test("shows actual additions and deletions without leaking temporary paths", () => diffFixture((record, before, after) => {

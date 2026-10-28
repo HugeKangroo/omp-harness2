@@ -47,7 +47,7 @@ integration("real OMP drives all nine controller stages, isolated snapshots, exp
     const runner = new OmpRpcRunner({ fixtureProviderForTests: true, env: { PATH: process.env.PATH } });
     const controller = new HarnessController({ workspace: root, runner });
     const created = await controller.create("H2_CONTROLLER_FIXTURE: change the value through scoped file tools.", {
-      model: "harness2-fixture/scripted", maxCostUsd: 0.1, stageTimeoutMs: 20000, maxDurationMs: 120000,
+      strategy: "legacy", model: "harness2-fixture/scripted", maxCostUsd: 0.1, stageTimeoutMs: 20000, maxDurationMs: 120000,
       ompCommand: process.env.OMP_COMMAND || "omp",
     });
     const result = await controller.execute(created.id);
@@ -70,5 +70,50 @@ integration("real OMP drives all nine controller stages, isolated snapshots, exp
     for (const stage of Object.values(result.stages)) {
       expect(await Bun.file(join(stage.cwd, "..", "artifacts", "worker-owner.json")).exists()).toBe(false);
     }
+  } finally { await rm(root, { recursive: true, force: true }); }
+}, 120000);
+
+integration("real OMP plans adaptive routes, reviews every anonymous artifact and reuses review without refinement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "h2-real-adaptive-"));
+  try {
+    expect(spawnSync("git", ["init", "-q", root]).status).toBe(0);
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/value.ts"), "export const value = 'initial';\n");
+    expect(spawnSync("git", ["-C", root, "add", "src/value.ts"]).status).toBe(0);
+    const runner = new OmpRpcRunner({ fixtureProviderForTests: true, env: { PATH: process.env.PATH } });
+    const controller = new HarnessController({ workspace: root, runner });
+    const created = await controller.create("H2_ADAPTIVE_FIXTURE: compare local representations for the requested value.ts update.", {
+      model: "harness2-fixture/scripted", maxCostUsd: 0.1, stageTimeoutMs: 20000, maxDurationMs: 120000,
+      ompCommand: process.env.OMP_COMMAND || "omp",
+    });
+    expect(created.config.strategy).toBe("auto");
+    const result = await controller.execute(created.id);
+    expect(result.status, result.error).toBe("completed");
+    expect(Object.keys(result.stages)).toEqual(["plan", "baseline", "route_1", "route_2", "review", "reflect"]);
+    expect(Object.values(result.stages).every(stage => stage.status === "completed" && stage.attempt === 1 && !stage.result?.text.includes("FIXTURE_FAILURE")), JSON.stringify(result.stages)).toBe(true);
+    expect(result.exploration?.plan.decision).toBe("explore");
+    expect(result.exploration?.plan.routes.map(route => route.name)).toEqual(["Literal value", "Computed value"]);
+    expect(result.winner).toBe("route_1");
+    expect(result.exploration?.review?.method).toBe("model_review");
+    expect(result.exploration?.selection).toEqual(result.exploration?.review);
+    expect(result.exploration?.selection?.assessments.map(item => item.candidate).sort()).toEqual(["baseline", "route_1", "route_2"]);
+    expect(result.exploration?.selection?.assessments.every(item => item.criteria.find(criterion => criterion.criterionId === "performance")?.verdict === "unknown")).toBe(true);
+    expect(result.exploration?.selection?.limitations).toContain("Static fixture inspection only; no tests or performance measurements.");
+    expect(result.stages.select).toBeUndefined();
+    expect(result.stages.refine).toBeUndefined();
+    expect(result.lesson).toBeUndefined();
+    expect((await controller.library.list("project", "harness2-fixture/scripted"))).toHaveLength(0);
+    expect(await readFile(join(root, "src/value.ts"), "utf8")).toContain("'initial'");
+    for (const stage of ["baseline", "route_1", "route_2"] as const) {
+      expect(await readFile(join(result.stages[stage]!.cwd, "src/value.ts"), "utf8")).toContain(`'${stage}'`);
+    }
+    const trace = await readFile(result.stages.review!.result!.eventsPath, "utf8");
+    for (const label of ["A", "B", "C"]) expect(trace).toContain(`.harness-evidence/${label}/files/src/value.ts`);
+    expect(accountedCost(result)).toBeGreaterThan(0);
+    expect((await controller.diff(created.id)).map(change => change.path)).toEqual(["src/value.ts"]);
+    expect((await controller.apply(created.id)).applied).toBe(true);
+    expect(await readFile(join(root, "src/value.ts"), "utf8")).toContain("'route_1'");
+    expect((await controller.apply(created.id)).alreadyApplied).toBe(true);
+    for (const stage of Object.values(result.stages)) expect(await Bun.file(join(stage.cwd, "..", "artifacts", "worker-owner.json")).exists()).toBe(false);
   } finally { await rm(root, { recursive: true, force: true }); }
 }, 120000);

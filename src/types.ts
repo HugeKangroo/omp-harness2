@@ -1,7 +1,40 @@
 /** Versioned wire/storage contracts. Never persist executable objects or secrets. */
 export type Mode = "product" | "research";
-export type StageId = "baseline" | "inv_edit" | "dom_edit" | "inv_probe" | "dom_probe" | "compose_edit" | "final" | "select" | "reflect";
+export type ExecutionStrategy = "auto" | "direct" | "explore" | "legacy";
+export const CANDIDATE_IDS = ["baseline", "inv_probe", "dom_probe", "final", "route_1", "route_2", "route_3", "refine"] as const;
+export type CandidateId = typeof CANDIDATE_IDS[number];
+export const STAGE_IDS = ["baseline", "inv_edit", "dom_edit", "inv_probe", "dom_probe", "compose_edit", "final", "select", "reflect", "plan", "route_1", "route_2", "route_3", "review", "refine"] as const;
+export type StageId = typeof STAGE_IDS[number];
 export type RunStatus = "queued" | "running" | "interrupted" | "completed" | "failed" | "cancelled" | "applied";
+
+export interface ExplorationCriterion { id: string; description: string; kind: "requirement" | "quality" }
+export interface ExplorationRoute {
+  id: "route_1" | "route_2" | "route_3";
+  name: string;
+  approach: string;
+  assumptions: string[];
+  tradeoffs: string[];
+}
+export interface ExplorationPlan {
+  decision: "direct" | "explore";
+  reason: string;
+  criteria: ExplorationCriterion[];
+  routes: ExplorationRoute[];
+}
+export interface ExplorationAssessment {
+  candidate: CandidateId;
+  criteria: Array<{ criterionId: string; verdict: "met" | "not_met" | "unknown"; evidence: string }>;
+  strengths: string[];
+  weaknesses: string[];
+}
+export interface ExplorationEvaluation {
+  method: "model_review" | "fallback";
+  assessments: ExplorationAssessment[];
+  winner: CandidateId | null;
+  reason: string;
+  limitations: string[];
+  refinement?: { candidate: CandidateId; instructions: string };
+}
 
 export interface HarnessSkill { name: string; description: string; content: string }
 export interface HarnessBundle {
@@ -16,6 +49,8 @@ export interface HarnessBundle {
 
 export interface RunConfig {
   mode: Mode;
+  /** Missing on pre-exploration records, which retain the legacy pipeline. */
+  strategy?: ExecutionStrategy;
   model: string;
   improverModel: string;
   maxCostUsd: number;
@@ -89,6 +124,8 @@ export interface StageRecord {
   traceHash?: string;
   validationFailures?: number;
   observedCostUsd?: number;
+  parentStage?: CandidateId;
+  parentArtifactHash?: string;
 }
 
 export interface Lesson {
@@ -123,7 +160,8 @@ export interface RunRecord {
   baseHarness: HarnessBundle;
   libraryEntries: LibraryEntry[];
   stages: Partial<Record<StageId, StageRecord>>;
-  winner?: "baseline" | "final";
+  winner?: CandidateId;
+  exploration?: { plan: ExplorationPlan; review?: ExplorationEvaluation; selection?: ExplorationEvaluation };
   selectionReason?: string;
   lesson?: Lesson;
   error?: string;

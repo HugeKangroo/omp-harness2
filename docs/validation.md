@@ -6,12 +6,12 @@
 
 | 命令或检查 | 结果 | 边界 |
 | --- | --- | --- |
-| `bun run check` | 严格 TypeScript 检查通过；79 pass、3 skip、0 fail，529 个断言 | 默认测试不发送模型请求 |
-| `RUN_REAL_OMP_TEST=1 bun test test/real-omp.test.ts` | 2 pass、0 fail，39 个断言 | 真实 OMP 二进制，固定无网络模拟 provider |
+| `bun run check` | 严格 TypeScript 检查通过；125 pass、4 skip、0 fail，1051 个断言 | 默认测试不发送模型请求 |
+| `RUN_REAL_OMP_TEST=1 bun test test/real-omp.test.ts` | 3 pass、0 fail，75 个断言 | 真实 OMP 二进制，固定无网络模拟 provider |
 | `bun src/cli.ts --json doctor` | `ok: true` | 检查 OMP 18.13.1、RPC v2、原生工具为空与仅 3 个 host 文件工具；无模型 prompt |
 | 实际 OMP 加载 `src/extension.ts` | `get_available_commands` 返回 `harness` | 验证插件加载和命令注册；未发送模型请求 |
 
-默认跳过的 3 项中，2 项真实 OMP 集成测试已通过独立命令执行。剩余 1 项是父进程退出后对同进程组后代的信号清理：当前受管环境对部分后代信号操作返回 `EPERM`，不能将该项标为通过。可在具备正确权限的部署环境中运行 `RUN_PROCESS_GROUP_TEST=1 bun test test/runner.test.ts`。
+默认跳过的 4 项中，3 项真实 OMP 集成测试已通过独立命令执行。剩余 1 项是父进程退出后对同进程组后代的信号清理：此前受管环境对部分后代信号操作返回 `EPERM`，本轮未重测，不能将该项标为通过。可在具备正确权限的部署环境中运行 `RUN_PROCESS_GROUP_TEST=1 bun test test/runner.test.ts`。
 
 ## 集成测试实际验证了什么
 
@@ -19,12 +19,19 @@
 
 第二项启动九个真实 OMP worker，跑完 baseline、INV/DOM 提议、两个 probe、compose、final、selector 和 reflection。验证各 solver 从原始快照开始，改进角色读取只读证据，选择 final 后经验入库，主项目保持原样，显式 apply 才应用产物且重复 apply 幂等。九个 worker 的归属记录均在确认清理后移除。
 
+第三项验证默认自适应 product：先冻结标准与两条路线，再独立执行 baseline 和各路线，匿名审阅全部产物。性能标准保留 `unknown`，所选路线无需 refinement 时复用 review；验证没有多余 select 调用、没有无依据经验、显式且幂等的 apply，以及 worker 归属清理。
+
+另有 19 项自适应 controller 回归，覆盖代码和文稿任务、直接执行、三路线择优、从父候选文件及纯文本响应继续改进、改进版本不如原候选、全部候选违反要求、未知费用、中断恢复、取消及产物篡改。这些使用 fake runner 验证状态机，不代表真实模型能稳定提出优质路线。
+
 模拟 provider 的 token 与费用是固定测试数据，只用于验证计量接线。没有使用真实 API key、调用远端模型或产生可报告的真实推理费用。该结果不证明 HTTP 传输、服务商账单、模型质量或 Harness² 的性能收益。
 
 ## 重要回归契约
 
 - INV/DOM 提议仅使用 baseline 证据，不能看到对方的候选轨迹。
 - 已完成阶段恢复时不重放；失联请求保留预算，结构校验失败次数不会因恢复重置。
+- review/select 派发后冻结候选集合；即使中断发生在 worker 完成与结构化结果持久化之间，也不会重跑失败分支而改变已有评审的对象。
+- refinement 保留父产物及指纹，子产物仍相对原始快照计算 diff/apply；原候选始终可以胜过改进版本。
+- 评估覆盖每个成功候选及每条冻结标准；已知违反硬性要求的候选不能被选中，格式回退仅记录未知判断。
 - 无效或无法确认的 worker 归属阻止重复调度。
 - 持久化文件使用严格 schema、CAS、锁和原子替换；损坏数据不静默回退。
 - 已接纳轨迹和产物有指纹校验，选定后修改的候选不能被 apply。

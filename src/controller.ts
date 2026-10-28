@@ -2,13 +2,23 @@ import { randomUUID, createHash } from "node:crypto";
 import { mkdir, readFile, writeFile, copyFile, lstat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { RunStore, LibraryStore } from "./store.ts";
-import { captureSnapshot, materializeSnapshot, diffWorkspace, applyWorkspace } from "./workspace.ts";
-import { baseHarness, parseHarness, parseJsonResponse, parseLesson, ValidationError } from "./surface.ts";
+import { captureSnapshot, materializeSnapshot, materializeCandidate, diffWorkspace, applyWorkspace } from "./workspace.ts";
+import { baseHarness, makeHarness, parseHarness, parseJsonResponse, parseLesson, ValidationError } from "./surface.ts";
 import { proposalPrompt, composePrompt, selectorPrompt, reflectionPrompt } from "./prompts.ts";
+import { directPlan, parseExplorationPlan, parseExplorationEvaluation, fallbackEvaluation } from "./exploration.ts";
+import { planningPrompt, taskPrompt, evaluationPrompt, explorationReflectionPrompt } from "./exploration-prompts.ts";
+import { CANDIDATE_IDS } from "./types.ts";
 import { OmpRpcRunner } from "./runner.ts";
-import type { ApplyResult, Change, HarnessBundle, RunConfig, RunEvent, RunRecord, Runner, StageId, WorkerRequest } from "./types.ts";
+import type { ApplyResult, CandidateId, ExplorationEvaluation, Change, HarnessBundle, RunConfig, RunEvent, RunRecord, Runner, StageId, WorkerRequest } from "./types.ts";
 
-const SOLVERS: StageId[] = ["baseline", "inv_probe", "dom_probe", "final"];
+const SOLVERS: readonly StageId[] = CANDIDATE_IDS;
+interface StageOptions {
+  parentStage?: CandidateId;
+  visibleStages?: StageId[];
+  labels?: Partial<Record<StageId, string>>;
+  pendingStages?: number;
+}
+class CandidateFailure extends Error {}
 const ORDER: StageId[] = ["baseline", "inv_edit", "dom_edit", "inv_probe", "dom_probe", "compose_edit", "final", "select", "reflect"];
 const DEFAULTS: Omit<RunConfig, "model" | "improverModel"> = {
   mode: "product", maxCostUsd: 5, maxDurationMs: 30 * 60_000, stageTimeoutMs: 10 * 60_000,
@@ -16,12 +26,14 @@ const DEFAULTS: Omit<RunConfig, "model" | "improverModel"> = {
 };
 
 function configOf(value: Partial<RunConfig> & { model: string }): RunConfig {
-  const config: RunConfig = { ...DEFAULTS, ...value, improverModel: value.improverModel ?? value.model,
+  const config: RunConfig = { ...DEFAULTS, ...value, strategy: value.strategy ?? (value.mode === "research" ? "legacy" : "auto"), improverModel: value.improverModel ?? value.model,
     stageTimeoutMs: value.stageTimeoutMs ?? Math.min(DEFAULTS.stageTimeoutMs, value.maxDurationMs ?? DEFAULTS.maxDurationMs) };
   for (const name of ["model", "improverModel"] as const) {
     if (typeof config[name] !== "string" || !/^[^\s/]+\/[^\s]+$/.test(config[name])) throw new Error(`${name} must be an explicit provider/model identifier`);
   }
   if (!["product", "research"].includes(config.mode)) throw new Error("Unknown adoption mode");
+  if (!["auto", "direct", "explore", "legacy"].includes(config.strategy!)) throw new Error("Unknown execution strategy");
+  if (config.mode === "research" && config.strategy !== "legacy") throw new Error("Research mode requires legacy strategy");
   for (const field of ["maxCostUsd", "maxDurationMs", "stageTimeoutMs"] as const) {
     if (!Number.isFinite(config[field]) || config[field] <= 0) throw new Error(`${field} must be positive and finite`);
   }
@@ -126,46 +138,10 @@ export class HarnessController {
         await this.save(record);
         await this.event(record, "snapshot", `Frozen ${record.snapshot.files.length} files; excluded ${record.snapshot.excludedPaths?.length ?? 0} paths`);
       }
-      const step = (id: StageId, role: WorkerRequest["role"], harness: HarnessBundle, prompt: string) => this.runStage(record, id, role, harness, prompt, abort.signal);
-      const solverPrompt = `${record.task}\n\nWork only through the provided scoped file tools. Deliver the requested code changes and a concise description of the actual modifications. Shell execution and tests are unavailable; do not claim to have run them. Do not change project configuration, secrets, controller state, or instructions outside this task.`;
-      await step("baseline", "solver", record.baseHarness, solverPrompt);
-      await this.editStage(record, "inv_edit", record.baseHarness, proposalPrompt("INV", record), abort.signal);
-      await this.editStage(record, "dom_edit", record.baseHarness, proposalPrompt("DOM", record), abort.signal);
-      await step("inv_probe", "solver", record.stages.inv_edit!.harness!, solverPrompt);
-      await step("dom_probe", "solver", record.stages.dom_edit!.harness!, solverPrompt);
-      await this.editStage(record, "compose_edit", record.baseHarness, composePrompt(record), abort.signal);
-      await step("final", "solver", record.stages.compose_edit!.harness!, solverPrompt);
-      if (record.config.mode === "product") {
-        const reverse = this.reverse(record.id);
-        const output = { baseline: await this.deliverable(record, "baseline"), final: await this.deliverable(record, "final") };
-        await step("select", "selector", record.baseHarness, selectorPrompt(record.task, output, reverse));
-        try {
-          const selected = parseJsonResponse(record.stages.select!.result!.text) as { winner?: unknown; reason?: unknown };
-          if (!selected || (selected.winner !== "A" && selected.winner !== "B") || typeof selected.reason !== "string" || !selected.reason.trim() || selected.reason.length > 4000) throw new ValidationError("Malformed selector output");
-          record.winner = (selected.winner === "A") === reverse ? "final" : "baseline";
-          record.selectionReason = selected.reason;
-        } catch {
-          record.winner = "baseline";
-          record.selectionReason = "Selector output was invalid; product policy retained the baseline artifact.";
-          await this.event(record, "fallback", record.selectionReason, "select");
-        }
-      } else {
-        record.winner = "final";
-        record.selectionReason = "Research k=1: adopted the sole composed final, matching the reference implementation.";
-      }
-      await this.save(record);
-      const adopted = record.stages[record.winner]!.harness!;
-      try {
-        await step("reflect", "reflector", record.baseHarness, reflectionPrompt(record, adopted));
-        record.lesson = parseLesson(record.stages.reflect!.result!.text,
-          ORDER.filter(s => s !== "reflect" && record.stages[s]?.status === "completed"));
-      } catch (error) {
-        if (abort.signal.aborted) throw error;
-        delete record.lesson;
-        const warning = "Reflection did not produce valid experience; the adopted artifact remains available.";
-        record.warnings = [...(record.warnings ?? []), warning];
-        await this.event(record, "no_entry", warning, "reflect");
-      }
+      if ((record.config.strategy ?? "legacy") === "legacy") await this.executeLegacy(record, abort.signal);
+      else await this.executeAdaptive(record, abort.signal);
+      this.verifiedChanges(record, record.winner!);
+      const adopted = record.stages[record.winner!]!.harness!;
       await checkCancel();
       if (abort.signal.aborted) throw new Error("Cancellation requested before publishing experience");
       if (record.lesson) {
@@ -182,6 +158,175 @@ export class HarnessController {
       await this.event(record, record.status, record.error);
     } finally { clearInterval(timer); }
     return record;
+  }
+
+  private async executeLegacy(record: RunRecord, signal: AbortSignal): Promise<void> {
+    const step = (id: StageId, role: WorkerRequest["role"], harness: HarnessBundle, prompt: string) => this.runStage(record, id, role, harness, prompt, signal);
+    const solverPrompt = `${record.task}\n\nWork only through the provided scoped file tools. Deliver the requested code changes and a concise description of the actual modifications. Shell execution and tests are unavailable; do not claim to have run them. Do not change project configuration, secrets, controller state, or instructions outside this task.`;
+    await step("baseline", "solver", record.baseHarness, solverPrompt);
+    await this.editStage(record, "inv_edit", record.baseHarness, proposalPrompt("INV", record), signal);
+    await this.editStage(record, "dom_edit", record.baseHarness, proposalPrompt("DOM", record), signal);
+    await step("inv_probe", "solver", record.stages.inv_edit!.harness!, solverPrompt);
+    await step("dom_probe", "solver", record.stages.dom_edit!.harness!, solverPrompt);
+    await this.editStage(record, "compose_edit", record.baseHarness, composePrompt(record), signal);
+    await step("final", "solver", record.stages.compose_edit!.harness!, solverPrompt);
+    if (record.config.mode === "product") {
+      const reverse = this.reverse(record.id);
+      const output = { baseline: await this.deliverable(record, "baseline"), final: await this.deliverable(record, "final") };
+      await step("select", "selector", record.baseHarness, selectorPrompt(record.task, output, reverse));
+      try {
+        const selected = parseJsonResponse(record.stages.select!.result!.text) as { winner?: unknown; reason?: unknown };
+        if (!selected || (selected.winner !== "A" && selected.winner !== "B") || typeof selected.reason !== "string" || !selected.reason.trim() || selected.reason.length > 4000) throw new ValidationError("Malformed selector output");
+        record.winner = (selected.winner === "A") === reverse ? "final" : "baseline";
+        record.selectionReason = selected.reason;
+      } catch {
+        record.winner = "baseline";
+        record.selectionReason = "Selector output was invalid; product policy retained the baseline artifact.";
+        await this.event(record, "fallback", record.selectionReason, "select");
+      }
+    } else {
+      record.winner = "final";
+      record.selectionReason = "Research k=1: adopted the sole composed final, matching the reference implementation.";
+    }
+    await this.save(record);
+    const adopted = record.stages[record.winner]!.harness!;
+    try {
+      await step("reflect", "reflector", record.baseHarness, reflectionPrompt(record, adopted));
+      record.lesson = parseLesson(record.stages.reflect!.result!.text,
+        ORDER.filter(s => s !== "reflect" && record.stages[s]?.status === "completed"));
+    } catch (error) {
+      if (signal.aborted) throw error;
+      delete record.lesson;
+      const warning = "Reflection did not produce valid experience; the adopted artifact remains available.";
+      record.warnings = [...(record.warnings ?? []), warning];
+      await this.event(record, "no_entry", warning, "reflect");
+    }
+  }
+
+  private adaptiveCandidates(record: RunRecord): CandidateId[] {
+    return (["baseline", ...record.exploration!.plan.routes.map(route => route.id), "refine"] as CandidateId[])
+      .filter(id => record.stages[id]?.status === "completed");
+  }
+
+  private adaptivePending(record: RunRecord): number {
+    if (!record.exploration) return 9;
+    const plan = record.exploration.plan;
+    const order: StageId[] = plan.decision === "direct" ? ["baseline", "select"]
+      : ["baseline", ...plan.routes.map(route => route.id), "review", "refine", "select", "reflect"];
+    return Math.max(1, order.filter(id => record.stages[id]?.status !== "completed").length);
+  }
+
+  private async warn(record: RunRecord, message: string, stage: StageId): Promise<void> {
+    record.warnings = [...new Set([...(record.warnings ?? []), message])];
+    await this.save(record);
+    await this.event(record, "fallback", message, stage);
+  }
+
+  private async evaluate(record: RunRecord, id: "review" | "select", candidates: CandidateId[], preferred: CandidateId, allowRefinement: boolean, signal: AbortSignal): Promise<ExplorationEvaluation> {
+    // Deterministic anonymization survives resume without favoring the newest route.
+    const ordered = [...candidates].sort((a, b) => createHash("sha256").update(`${record.id}:${a}`).digest("hex")
+      .localeCompare(createHash("sha256").update(`${record.id}:${b}`).digest("hex")));
+    const labels: Record<string, CandidateId> = {};
+    const stageLabels: Partial<Record<StageId, string>> = {};
+    const outputs = ordered.map((candidate, index) => {
+      const label = String.fromCharCode(65 + index);
+      labels[label] = candidate; stageLabels[candidate] = label;
+      return { label, response: record.stages[candidate]!.result!.text, changes: this.verifiedChanges(record, candidate), files: `.harness-evidence/${label}/files/` };
+    });
+    await this.runStage(record, id, "selector", record.baseHarness,
+      evaluationPrompt(record.task, record.exploration!.plan, outputs, allowRefinement), signal,
+      { visibleStages: candidates, labels: stageLabels, pendingStages: this.adaptivePending(record) });
+    try {
+      return parseExplorationEvaluation(record.stages[id]!.result!.text, record.exploration!.plan, labels, allowRefinement);
+    } catch (error) {
+      if (!(error instanceof ValidationError)) throw error;
+      const reason = `Invalid ${id} assessment; retained ${preferred} without claiming verified correctness or comparative quality.`;
+      await this.warn(record, reason, id);
+      return fallbackEvaluation(record.exploration!.plan, candidates, preferred, reason);
+    }
+  }
+
+  private async optionalCandidate(record: RunRecord, id: CandidateId, harness: HarnessBundle, prompt: string, signal: AbortSignal, parentStage?: CandidateId): Promise<void> {
+    try {
+      await this.runStage(record, id, "solver", harness, prompt, signal,
+        { pendingStages: this.adaptivePending(record), ...(parentStage ? { parentStage } : {}) });
+    } catch (error) {
+      // Only a returned, in-budget worker failure may lose its branch. Process loss,
+      // cancellation, time/cost limits and evidence integrity failures stop the run.
+      if (!(error instanceof CandidateFailure) || signal.aborted) throw error;
+      await this.assertNoOrphanWorkers(record);
+      await this.warn(record, `${id} failed; its partial artifact is excluded from comparison.`, id);
+    }
+  }
+
+  private async executeAdaptive(record: RunRecord, signal: AbortSignal): Promise<void> {
+    const strategy = record.config.strategy as "auto" | "direct" | "explore";
+    if (!record.exploration) {
+      if (strategy === "direct") record.exploration = { plan: directPlan("Explicit direct strategy; execute one candidate against the task constraints.") };
+      else {
+        await this.runStage(record, "plan", "editor", record.baseHarness, planningPrompt(record), signal,
+          { visibleStages: [], pendingStages: this.adaptivePending(record) });
+        try { record.exploration = { plan: parseExplorationPlan(record.stages.plan!.result!.text, strategy) }; }
+        catch (error) {
+          if (!(error instanceof ValidationError) || strategy !== "auto") throw error;
+          record.exploration = { plan: directPlan("Planner output was invalid; auto conservatively uses a direct attempt.") };
+          await this.warn(record, record.exploration.plan.reason, "plan");
+        }
+      }
+      await this.save(record);
+      await this.event(record, "planned", `${record.exploration.plan.decision}: ${record.exploration.plan.reason}`, "plan");
+    }
+    if (!record.exploration!.selection) {
+      await this.runStage(record, "baseline", "solver", record.baseHarness, taskPrompt(record), signal,
+        { pendingStages: this.adaptivePending(record) });
+      if (record.exploration!.plan.decision === "explore") {
+        // Once review dispatch is durable, freeze its candidate set, including the
+        // crash window between worker completion and parsing/saving its decision.
+        if (!record.exploration!.review) {
+          if (!record.stages.review) for (const route of record.exploration!.plan.routes) {
+            const harness = makeHarness({ promptAppend: `Alternative approach: ${route.approach}`, toolGuidance: "Use only scoped file tools; state unavailable verification explicitly.", skills: [], rationale: `Explore ${route.name}` }, record.baseHarness.id);
+            await this.optionalCandidate(record, route.id, harness, taskPrompt(record, route), signal);
+          }
+          const candidates = this.adaptiveCandidates(record);
+          const review = await this.evaluate(record, "review", candidates, "baseline", candidates.length > 1, signal);
+          record.exploration!.review = review;
+          await this.save(record);
+        }
+        if (record.exploration!.review.winner === null) throw new Error("No candidate passed the reviewed requirements; no artifact was adopted.");
+        const refinement = record.exploration!.review.refinement;
+        if (refinement) {
+          const parent = record.stages[refinement.candidate]!;
+          const route = record.exploration!.plan.routes.find(item => item.id === refinement.candidate);
+          if (!record.stages.select) await this.optionalCandidate(record, "refine", parent.harness!, taskPrompt(record, route, refinement.instructions, parent.result!.text), signal, refinement.candidate);
+          const selection = await this.evaluate(record, "select", this.adaptiveCandidates(record), record.exploration!.review.winner, false, signal);
+          record.exploration!.selection = selection;
+        } else {
+          // Reuse the complete comparison if no new artifact exists.
+          record.exploration!.selection = record.exploration!.review;
+        }
+      } else {
+        const selection = await this.evaluate(record, "select", ["baseline"], "baseline", false, signal);
+        record.exploration!.selection = selection;
+      }
+      if (record.exploration!.selection.winner !== null) {
+        record.winner = record.exploration!.selection.winner;
+        record.selectionReason = record.exploration!.selection.reason;
+      }
+      await this.save(record);
+    }
+    if (!record.winner || record.exploration!.selection.winner === null) throw new Error("No candidate passed the reviewed requirements; no artifact was adopted.");
+    const candidates = this.adaptiveCandidates(record);
+    for (const candidate of candidates) this.verifiedChanges(record, candidate);
+    if (candidates.length < 2) return;
+    try {
+      await this.runStage(record, "reflect", "reflector", record.baseHarness, explorationReflectionPrompt(record, candidates), signal,
+        { visibleStages: candidates, pendingStages: 1 });
+      record.lesson = parseLesson(record.stages.reflect!.result!.text, candidates, candidates);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      delete record.lesson;
+      await this.warn(record, "Reflection did not produce valid comparative experience; the selected artifact remains available.", "reflect");
+    }
   }
 
   private reverse(id: string): boolean { return (createHash("sha256").update(id).digest()[0]! & 1) === 1; }
@@ -224,16 +369,16 @@ export class HarnessController {
     return JSON.stringify({ response: stage.result!.text, changes, files: `Read .harness-evidence/${this.reverse(record.id) === (id === "final") ? "A" : "B"}/files for actual changed file contents.` });
   }
 
-  private async prepareEvidence(record: RunRecord, cwd: string, role: WorkerRequest["role"], target: StageId): Promise<void> {
+  private async prepareEvidence(record: RunRecord, cwd: string, role: WorkerRequest["role"], target: StageId, options: StageOptions): Promise<void> {
     if (role === "solver") return;
-    const visible: StageId[] = target === "inv_edit" || target === "dom_edit" ? ["baseline"]
+    const visible: StageId[] = options.visibleStages ?? (target === "inv_edit" || target === "dom_edit" ? ["baseline"]
       : target === "compose_edit" ? ["baseline", "inv_edit", "dom_edit", "inv_probe", "dom_probe"]
-      : role === "selector" ? ["baseline", "final"] : ORDER.filter(id => id !== "reflect");
+      : role === "selector" ? ["baseline", "final"] : ORDER.filter(id => id !== "reflect"));
     for (const id of visible) {
       const stage = record.stages[id];
       if (!stage || stage.status !== "completed") continue;
-      if (role === "selector" && id !== "baseline" && id !== "final") continue;
-      const label = role === "selector" ? (this.reverse(record.id) === (id === "final") ? "A" : "B") : id;
+      if (!options.visibleStages && role === "selector" && id !== "baseline" && id !== "final") continue;
+      const label = options.labels?.[id] ?? (role === "selector" ? (this.reverse(record.id) === (id === "final") ? "A" : "B") : id);
       const dir = path.join(cwd, ".harness-evidence", label);
       await mkdir(dir, { recursive: true, mode: 0o700 });
       if (role !== "selector" && stage.result?.eventsPath) {
@@ -283,27 +428,37 @@ export class HarnessController {
     }
   }
 
-  private async runStage(record: RunRecord, id: StageId, role: WorkerRequest["role"], harness: HarnessBundle, prompt: string, signal: AbortSignal): Promise<void> {
+  private async runStage(record: RunRecord, id: StageId, role: WorkerRequest["role"], harness: HarnessBundle, prompt: string, signal: AbortSignal, options: StageOptions = {}): Promise<void> {
+    if (options.parentStage) {
+      this.verifiedChanges(record, options.parentStage);
+      const old = record.stages[id];
+      if (old?.status === "completed" && (old.parentStage !== options.parentStage || old.parentArtifactHash !== record.stages[options.parentStage]!.artifactHash)) throw new Error("Refinement parent changed after admission");
+    }
     if (record.stages[id]?.status === "completed") return;
     if (signal.aborted) throw new Error("Cancellation requested");
     const remainingMs = Date.parse(record.createdAt) + record.config.maxDurationMs - Date.now();
     if (remainingMs <= 0) throw new Error("Run wall-clock deadline expired; create a new run to extend the deadline");
     const left = record.config.maxCostUsd - accountedCost(record);
     if (left <= 0.000001) throw new Error("Run cost budget exhausted (interrupted attempts retain their reservations)");
-    const pending = ORDER.filter(s => !(s === "select" && record.config.mode === "research") && record.stages[s]?.status !== "completed").length;
+    await this.assertNoOrphanWorkers(record);
+    const pending = options.pendingStages ?? ORDER.filter(s => !(s === "select" && record.config.mode === "research") && record.stages[s]?.status !== "completed").length;
     const allowance = left / Math.max(1, pending);
     const old = record.stages[id];
     const attempt = (old?.attempt ?? 0) + 1;
     const dir = path.join(this.store.runDir(record.id), "stages", id, `attempt-${attempt}-${randomUUID()}`);
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const cwd = path.join(dir, "workspace");
-    materializeSnapshot(record.snapshot!, cwd);
-    await this.prepareEvidence(record, cwd, role, id);
+    if (options.parentStage) {
+      materializeCandidate(record.snapshot!, record.stages[options.parentStage]!.cwd, cwd);
+      this.verifiedChanges(record, options.parentStage);
+    } else materializeSnapshot(record.snapshot!, cwd);
+    await this.prepareEvidence(record, cwd, role, id, options);
     const prior = old?.accountedCostUsd ?? old?.result?.usage.costUsd ?? 0;
     const priorObserved = old?.observedCostUsd ?? (old?.result?.usageEstimated ? 0 : old?.result?.usage.costUsd ?? 0);
     record.stages[id] = { id, status: "running", attempt, cwd, startedAt: new Date().toISOString(),
       ...(role === "solver" ? { harness } : {}), accountedCostUsd: prior + allowance, reservedCostUsd: allowance,
       observedCostUsd: priorObserved,
+      ...(options.parentStage ? { parentStage: options.parentStage, parentArtifactHash: record.stages[options.parentStage]!.artifactHash! } : {}),
       ...(old?.validationFailures === undefined ? {} : { validationFailures: old.validationFailures }) };
     // Reservation is durable BEFORE dispatch. A crash cannot make an attempted run free.
     await this.save(record);
@@ -326,6 +481,7 @@ export class HarnessController {
       stage.status = "failed";
       stage.error = result.error ?? (signal.aborted ? "Cancellation requested" : result.usage.costUsd > allowance ? "Worker exceeded its allocated cost budget" : `Worker ${result.status}`);
       await this.save(record);
+      if (!signal.aborted && result.status === "failed" && !result.usageEstimated && result.usage.costUsd <= allowance + 0.000001) throw new CandidateFailure(stage.error);
       throw new Error(stage.error);
     }
     if (role === "solver") {

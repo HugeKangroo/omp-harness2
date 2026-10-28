@@ -2,11 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { HarnessBundle, LibraryEntry, RunEvent, RunRecord } from "./types.ts";
+import { CANDIDATE_IDS, STAGE_IDS, type HarnessBundle, type LibraryEntry, type RunEvent, type RunRecord } from "./types.ts";
+import { validateExplorationEvaluation, validateExplorationPlan } from "./exploration.ts";
 
 const IDS = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const STATUSES = new Set(["queued", "running", "interrupted", "completed", "failed", "cancelled", "applied"]);
-const STAGES = new Set(["baseline", "inv_edit", "dom_edit", "inv_probe", "dom_probe", "compose_edit", "final", "select", "reflect"]);
+const STAGES = new Set<string>(STAGE_IDS);
+const CANDIDATES = new Set<string>(CANDIDATE_IDS);
+const ADAPTIVE_STAGES = new Set(["plan", "route_1", "route_2", "route_3", "review", "refine"]);
 const queues = new Map<string, Promise<unknown>>();
 
 export class StoreConflictError extends Error { override name = "StoreConflictError"; }
@@ -55,18 +58,30 @@ function validateRun(value: unknown, id?: string): asserts value is RunRecord {
   const config = value.config;
   invariant(object(config), "run.config");
   invariant(typeof config.mode === "string" && ["product", "research"].includes(config.mode), "config.mode");
+  if (config.strategy !== undefined) invariant(typeof config.strategy === "string" && ["auto", "direct", "explore", "legacy"].includes(config.strategy), "config.strategy");
+  const adaptive = config.strategy !== undefined && config.strategy !== "legacy";
+  invariant(config.mode !== "research" || !adaptive, "research mode requires legacy strategy");
   for (const key of ["model", "improverModel", "domain", "ompCommand"]) invariant(nonempty(config[key]), `config.${key}`);
   for (const key of ["maxCostUsd", "maxDurationMs", "stageTimeoutMs"]) invariant(finite(config[key]), `config.${key}`);
   validateHarness(value.baseHarness);
   invariant(Array.isArray(value.libraryEntries), "run.libraryEntries"); value.libraryEntries.forEach(validateLibrary);
-  invariant(object(value.stages), "run.stages");
-  for (const [key, stage] of Object.entries(value.stages)) {
+  const stages = value.stages;
+  invariant(object(stages), "run.stages");
+  for (const [key, stage] of Object.entries(stages)) {
     invariant(STAGES.has(key) && object(stage) && stage.id === key, "stage ID");
+    invariant(adaptive || !ADAPTIVE_STAGES.has(key), "adaptive stage requires an explicit strategy");
     invariant(typeof stage.status === "string" && ["running", "completed", "failed"].includes(stage.status) && Number.isSafeInteger(stage.attempt) && (stage.attempt as number) >= 1, "stage status/attempt");
     invariant(typeof stage.cwd === "string" && timestamp(stage.startedAt), "stage workspace/time");
     if (stage.harness !== undefined) validateHarness(stage.harness);
     for (const field of ["accountedCostUsd", "reservedCostUsd", "observedCostUsd"]) if (stage[field] !== undefined) invariant(finite(stage[field]), `stage.${field}`);
-    for (const field of ["artifactHash", "traceHash"]) if (stage[field] !== undefined) invariant(typeof stage[field] === "string" && /^[a-fA-F0-9]{64}$/.test(stage[field]), `stage.${field}`);
+    for (const field of ["artifactHash", "traceHash", "parentArtifactHash"]) if (stage[field] !== undefined) invariant(typeof stage[field] === "string" && /^[a-fA-F0-9]{64}$/.test(stage[field]), `stage.${field}`);
+    invariant((stage.parentStage === undefined) === (stage.parentArtifactHash === undefined), "stage parent reference/hash pairing");
+    if (key === "refine") invariant(stage.parentStage !== undefined, "refine parent reference");
+    if (stage.parentStage !== undefined) {
+      invariant(typeof stage.parentStage === "string" && CANDIDATES.has(stage.parentStage) && stage.parentStage !== key, "stage.parentStage");
+      const parent = stages[stage.parentStage];
+      invariant(object(parent) && parent.status === "completed" && parent.artifactHash === stage.parentArtifactHash, "stage parent artifact reference");
+    }
     if (stage.validationFailures !== undefined) invariant(Number.isSafeInteger(stage.validationFailures) && (stage.validationFailures as number) >= 0, "stage.validationFailures");
     if (stage.result !== undefined) {
       invariant(object(stage.result) && object(stage.result.usage), "stage.result.usage");
@@ -77,7 +92,37 @@ function validateRun(value: unknown, id?: string): asserts value is RunRecord {
     }
   }
   if (value.lesson !== undefined) validateLesson(value.lesson);
-  if (value.winner !== undefined) invariant(value.winner === "baseline" || value.winner === "final", "run.winner");
+  if (["route_1", "route_2", "route_3", "review", "refine"].some(id => stages[id] !== undefined)) invariant(value.exploration !== undefined, "adaptive execution requires its saved plan");
+  if (value.winner !== undefined) {
+    invariant(typeof value.winner === "string" && CANDIDATES.has(value.winner), "run.winner");
+    if (adaptive) {
+      const winner = stages[value.winner];
+      invariant(object(winner) && winner.status === "completed", "winner completed candidate reference");
+      invariant(object(value.exploration) && value.exploration.selection !== undefined, "adaptive winner requires its saved selection");
+    } else invariant(value.winner === "baseline" || value.winner === "final", "legacy run.winner");
+  }
+  if (value.exploration !== undefined) {
+    invariant(adaptive && object(value.exploration), "run.exploration");
+    const exploration = value.exploration;
+    invariant(Object.keys(exploration).every(key => ["plan", "review", "selection"].includes(key)), "exploration fields");
+    validateExplorationPlan(exploration.plan);
+    invariant(config.strategy === "auto" || config.strategy === exploration.plan.decision, "exploration plan respects strategy");
+    const planned = new Set(exploration.plan.routes.map(route => route.id));
+    for (const id of ["route_1", "route_2", "route_3"] as const) if (stages[id] !== undefined) invariant(planned.has(id), "stage references a planned route");
+    const completed = (["baseline", ...exploration.plan.routes.map(route => route.id), "refine"] as const).filter(id => {
+      const stage = stages[id];
+      return object(stage) && stage.status === "completed";
+    });
+    if (exploration.review !== undefined) validateExplorationEvaluation(exploration.review, exploration.plan, completed.filter(id => id !== "refine"));
+    if (stages.refine !== undefined) {
+      invariant(object(stages.refine) && exploration.review !== undefined && exploration.review.refinement?.candidate === stages.refine.parentStage, "refinement lineage matches its saved review");
+    }
+    if (exploration.selection !== undefined) {
+      validateExplorationEvaluation(exploration.selection, exploration.plan, completed);
+      invariant(exploration.selection.refinement === undefined, "final selection cannot request refinement");
+      if (value.winner !== undefined) invariant(value.winner === exploration.selection.winner, "run winner matches selection");
+    }
+  }
 }
 function validateEvent(value: unknown, id?: string): asserts value is RunEvent {
   invariant(object(value) && value.schemaVersion === 1 && nonempty(value.runId), "event version/runId");

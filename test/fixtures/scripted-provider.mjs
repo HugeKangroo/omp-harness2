@@ -38,6 +38,63 @@ function controllerStep(context, results) {
   return { text: "FIXTURE_FAILURE: unknown role" };
 }
 
+/** Exercise adaptive planning and anonymous artifact review with fixed local responses. */
+function adaptiveStep(context, results) {
+  const input = textOf(context.messages.find(message => message.role === "user")?.content);
+  const task = JSON.parse(input.slice(input.indexOf("\n\n") + 2)).task;
+  const role = /Harness2 (\w+) task/.exec(input)?.[1];
+  const expectedTools = role === "solver" ? "list_files,read_file,write_file" : "list_files,read_file";
+  if (context.tools.map(tool => tool.name).sort().join(",") !== expectedTools || results.some(result => result.isError)) return { text: "FIXTURE_FAILURE: adaptive role tools or host tool result" };
+  const read = path => ({ call: { type: "toolCall", id: `adaptive-read-${results.length}`, name: "read_file", arguments: { path } } });
+  if (task.startsWith("Decide how much exploration")) {
+    if (results.length === 0) return read("src/value.ts");
+    return { text: JSON.stringify({
+      decision: "explore", reason: "The fixed fixture compares a literal and a computed representation to validate route execution.",
+      criteria: [
+        { id: "file_update", description: "Produce the requested local value.ts update.", kind: "requirement" },
+        { id: "performance", description: "Establish runtime performance only with measured evidence.", kind: "quality" },
+      ],
+      routes: [
+        { id: "route_1", name: "Literal value", approach: "Use an explicit value with minimal structure.", assumptions: ["The value is fixed"], tradeoffs: ["Less adaptable"] },
+        { id: "route_2", name: "Computed value", approach: "Derive the value through a reusable helper.", assumptions: ["Future inputs may vary"], tradeoffs: ["More structure"] },
+      ],
+    }) };
+  }
+  if (role === "solver") {
+    const label = task.includes('"id":"route_1"') ? "route_1" : task.includes('"id":"route_2"') ? "route_2" : "baseline";
+    if (results.length === 0) return read("src/value.ts");
+    if (!textOf(results[0].content).includes("'initial'")) return { text: "FIXTURE_FAILURE: adaptive solver did not start from original snapshot" };
+    if (results.length === 1) return { call: { type: "toolCall", id: "adaptive-write", name: "write_file", arguments: { path: "src/value.ts", content: `export const value = '${label}';\n` } } };
+    return { text: `Synthetic ${label} file update. No tests or performance measurements were executed.` };
+  }
+  if (role === "selector") {
+    const payload = task.split("EVALUATION INPUT:\n")[1];
+    if (!payload) return { text: "FIXTURE_FAILURE: missing adaptive evaluation input" };
+    const evaluation = JSON.parse(payload.split("\n")[0]);
+    if (results.length < evaluation.candidates.length) return read(`.harness-evidence/${evaluation.candidates[results.length].label}/files/src/value.ts`);
+    const winnerIndex = results.findIndex(result => textOf(result.content).includes("'route_1'"));
+    if (winnerIndex < 0) return { text: "FIXTURE_FAILURE: selected route artifact was not readable" };
+    return { text: JSON.stringify({
+      assessments: evaluation.candidates.map((candidate, index) => ({
+        candidate: candidate.label,
+        criteria: evaluation.criteria.map(criterion => ({ criterionId: criterion.id,
+          verdict: criterion.id === "performance" ? "unknown" : "met",
+          evidence: criterion.id === "performance" ? "The fixture has no performance measurement tool or executed benchmark." : `Read ${candidate.label}/files/src/value.ts through scoped host tools: ${textOf(results[index].content).slice(0, 600)}`,
+        })),
+        strengths: ["The requested file update is present."], weaknesses: [],
+      })),
+      winner: evaluation.candidates[winnerIndex].label,
+      reason: "Fixed fixture selection after reading all anonymous artifacts; no model-quality claim.",
+      limitations: ["Static fixture inspection only; no tests or performance measurements."],
+    }) };
+  }
+  if (role === "reflector") {
+    if (results.length === 0) return read(".harness-evidence/route_1/changes.json");
+    return { text: '{"noEntry":true}' };
+  }
+  return { text: "FIXTURE_FAILURE: unknown adaptive role" };
+}
+
 /** Fixed, network-free provider fixture. Registers no tool or event handler. */
 export default function scriptedProvider(pi) {
   pi.registerProvider("harness2-fixture", {
@@ -50,7 +107,8 @@ export default function scriptedProvider(pi) {
       queueMicrotask(() => {
         const serialized = JSON.stringify(context);
         const results = context.messages.filter(message => message.role === "toolResult");
-        const controller = serialized.includes("H2_CONTROLLER_FIXTURE") ? controllerStep(context, results) : undefined;
+        const controller = serialized.includes("H2_ADAPTIVE_FIXTURE") ? adaptiveStep(context, results)
+          : serialized.includes("H2_CONTROLLER_FIXTURE") ? controllerStep(context, results) : undefined;
         let violation;
         if (serialized.includes("OUTSIDE_FILE_MUST_NEVER_REACH_MODEL_7f31")) violation = "Outside file leaked through ingress.";
         if (results.length === 0 && serialized.includes("SKILL_BODY_ON_DEMAND_b7c1")) violation = "Skill body was preloaded.";

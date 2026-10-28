@@ -190,6 +190,33 @@ function candidateFiles(root: string): Map<string, FileEntry> {
   return new Map(files.map(entry => [entry.path, entry]));
 }
 
+/** Continue a candidate in a separate workspace while keeping the original apply baseline. */
+export function materializeCandidate(snapshot: WorkspaceSnapshot, candidateRoot: string, destinationRoot: string): void {
+  snapshotManifest(snapshot);
+  const source = rootDirectory(snapshot.sourceRoot);
+  const original = rootDirectory(snapshot.root);
+  const candidate = rootDirectory(candidateRoot);
+  const destination = destinationPath(destinationRoot);
+  if (inside(candidate, source) || inside(candidate, original) || inside(original, candidate)) throw new Error("Unsafe parent candidate workspace");
+  if (inside(source, candidate) && !path.relative(source, candidate).split(path.sep).some(p => omittedDirectories.has(p.toLowerCase()))) throw new Error("Parent candidate inside source must be under an excluded directory");
+  if (inside(candidate, destination) || inside(destination, candidate)) throw new Error("Parent and child candidate workspaces must not overlap");
+  if (inside(original, destination) || inside(destination, original)) throw new Error("Child candidate must not overlap the original snapshot");
+  if (fs.existsSync(destination) && fs.readdirSync(destination).length) throw new Error("Child candidate destination must be new or empty");
+  const marker = JSON.parse(readFile(candidate, ORIGIN).bytes.toString("utf8")) as { snapshotId?: unknown; destination?: unknown } | null;
+  if (!marker || marker.snapshotId !== snapshot.id || marker.destination !== candidate) throw new Error("Parent candidate does not belong to this snapshot");
+  const continuation: WorkspaceSnapshot = { ...snapshot, root: candidate, files: [...candidateFiles(candidate).values()] };
+  // This descriptor exists only for copying. Its ID/source stay bound to the
+  // original snapshot, which remains authoritative for diff and explicit apply.
+  try {
+    materializeSnapshot(continuation, destination);
+    snapshotManifest({ ...continuation, root: destination });
+  } catch (error) {
+    // The destination was empty and cannot overlap either parent or baseline.
+    if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 export function diffWorkspace(snapshot: WorkspaceSnapshot, candidateRoot: string): Change[] {
   const before = snapshotManifest(snapshot);
   const after = candidateFiles(rootDirectory(candidateRoot));

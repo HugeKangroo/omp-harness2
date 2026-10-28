@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { applyWorkspace, captureSnapshot, diffWorkspace, materializeSnapshot, recoverInterruptedApplies, WORKSPACE_LIMITS } from "../src/workspace.js";
+import { applyWorkspace, captureSnapshot, diffWorkspace, materializeCandidate, materializeSnapshot, recoverInterruptedApplies, WORKSPACE_LIMITS } from "../src/workspace.js";
 import type { WorkspaceSnapshot } from "../src/types.ts";
 
 const temporary: string[] = [];
@@ -95,6 +95,64 @@ describe("workspace snapshots", () => {
     try { expect(() => captureSnapshot(f.source, f.snapshotRoot)).toThrow("changed during snapshot"); }
     finally { mocked.mockRestore(); }
     expect(fs.existsSync(f.snapshotRoot)).toBe(false);
+  });
+});
+
+describe("candidate continuation", () => {
+  test("inherits parent changes independently and keeps diff/apply relative to the original snapshot", () => {
+    const f = fixture(); put(f.source, "delete.txt", "remove me"); put(f.source, "run.sh", "echo original\n"); fs.chmodSync(path.join(f.source, "run.sh"), 0o644);
+    const snapshot = captureSnapshot(f.source, f.snapshotRoot); const originalSnapshot = structuredClone(snapshot); materializeSnapshot(snapshot, f.candidate);
+    put(f.candidate, "file.txt", "parent edit"); put(f.candidate, "nested/added.txt", "parent addition");
+    fs.unlinkSync(path.join(f.candidate, "delete.txt")); fs.chmodSync(path.join(f.candidate, "run.sh"), 0o755);
+    const parentChanges = diffWorkspace(snapshot, f.candidate);
+    const child = path.join(f.root, "child"); materializeCandidate(snapshot, f.candidate, child);
+    expect(snapshot).toEqual(originalSnapshot);
+    expect(diffWorkspace(snapshot, child)).toEqual(parentChanges);
+    expect(fs.readFileSync(path.join(child, "file.txt"), "utf8")).toBe("parent edit");
+    expect(fs.readFileSync(path.join(child, "nested/added.txt"), "utf8")).toBe("parent addition");
+    expect(fs.existsSync(path.join(child, "delete.txt"))).toBe(false);
+    expect(fs.statSync(path.join(child, "run.sh")).mode & 0o777).toBe(0o755);
+    expect(JSON.parse(fs.readFileSync(path.join(child, ".harness2-origin.json"), "utf8"))).toEqual({ snapshotId: snapshot.id, destination: child });
+    put(child, "file.txt", "child edit"); put(child, "nested/added.txt", "child addition edit");
+    expect(diffWorkspace(snapshot, f.candidate)).toEqual(parentChanges);
+    expect(fs.readFileSync(path.join(f.candidate, "file.txt"), "utf8")).toBe("parent edit");
+    expect(fs.readFileSync(path.join(f.candidate, "nested/added.txt"), "utf8")).toBe("parent addition");
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("original");
+    expect(diffWorkspace(snapshot, child).map(change => [change.path, change.kind])).toEqual([["delete.txt", "delete"], ["file.txt", "modify"], ["nested/added.txt", "add"], ["run.sh", "modify"]]);
+    expect(applyWorkspace(snapshot, child).applied).toBe(true);
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("child edit");
+    expect(fs.readFileSync(path.join(f.source, "nested/added.txt"), "utf8")).toBe("child addition edit");
+    expect(fs.existsSync(path.join(f.source, "delete.txt"))).toBe(false);
+    expect(fs.statSync(path.join(f.source, "run.sh")).mode & 0o777).toBe(0o755);
+  });
+  test("refuses overlaps, source-tree destinations and existing child contents", () => {
+    const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    for (const destination of [f.candidate, path.join(f.candidate, "child"), f.root, f.snapshotRoot, path.join(f.snapshotRoot, "child"), f.source, path.join(f.source, "child")]) {
+      expect(() => materializeCandidate(snapshot, f.candidate, destination)).toThrow();
+    }
+    const child = path.join(f.root, "child"); materializeCandidate(snapshot, f.candidate, child); put(child, "keep.txt", "existing child edit");
+    expect(() => materializeCandidate(snapshot, f.candidate, child)).toThrow("new or empty");
+    expect(fs.readFileSync(path.join(child, "keep.txt"), "utf8")).toBe("existing child edit");
+    expect(fs.readFileSync(path.join(f.candidate, "file.txt"), "utf8")).toBe("original");
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("original");
+  });
+  test("rejects protected candidate files, wrong ownership and symlink paths", () => {
+    const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    const child = path.join(f.root, "child");
+    for (const file of [".env", "AGENTS.md", ".git/config", ".harness-evidence/forged.json"]) {
+      put(f.candidate, file, "protected");
+      expect(() => materializeCandidate(snapshot, f.candidate, child)).toThrow("protected");
+      fs.rmSync(path.join(f.candidate, file.split("/")[0]!), { recursive: true });
+    }
+    fs.symlinkSync("file.txt", path.join(f.candidate, "link.txt"));
+    expect(() => materializeCandidate(snapshot, f.candidate, child)).toThrow("symlink"); fs.unlinkSync(path.join(f.candidate, "link.txt"));
+    fs.symlinkSync(f.candidate, path.join(f.root, "parent-link"));
+    expect(() => materializeCandidate(snapshot, path.join(f.root, "parent-link"), child)).toThrow("real directory");
+    fs.symlinkSync(f.candidate, child); expect(() => materializeCandidate(snapshot, f.candidate, child)).toThrow("Symlink"); fs.unlinkSync(child);
+    put(f.candidate, ".harness2-origin.json", JSON.stringify({ snapshotId: "different", destination: f.candidate }));
+    expect(() => materializeCandidate(snapshot, f.candidate, child)).toThrow("does not belong");
+    expect(fs.existsSync(child)).toBe(false);
+    expect(fs.readFileSync(path.join(f.candidate, "file.txt"), "utf8")).toBe("original");
   });
 });
 

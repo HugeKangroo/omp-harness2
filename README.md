@@ -1,6 +1,6 @@
 # omp-harness2
 
-面向 Oh My Pi 的 Harness² 插件：在同一代码快照上执行基线、通用候选、领域候选和合成候选，依据真实执行记录选择产物，并保存有证据支持的改进经验。
+面向 Oh My Pi 的本地任务插件：提交一次自然语言任务，系统判断直接完成还是探索不同方案，依据预先确定的标准审阅实际产物，交付可查看、可应用的结果。适用于仓库内的代码修改、文稿、方案和其他文本文件任务。
 
 **状态：`0.1.0-alpha.1`，产品基础实现，尚未达到面向日常使用的发布门槛。** 当前支持固定、受限的 OMP 文件编辑 profile；它不等于用户完整的原生 OMP 配置。没有声称复现论文的性能增益。
 
@@ -25,12 +25,14 @@ omp -e /absolute/path/to/omp-harness2/src/extension.ts
 Worker 只接收显式 API key 环境变量，例如 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`；也支持 `HARNESS2_API_KEY`。不复制 OMP 登录数据库，不继承 OAuth/订阅登录。不同 improver/executor provider 应分别设置其 API key，而不要使用一个通用 key。
 
 ```text
-/harness run 修复解析器对空输入的处理 --model openai/gpt-4.1 --budget 5
+/harness run 为这个项目写一份简洁的入门说明 --model openai/gpt-4.1 --budget 5
 /harness status
 /harness show <run-id>
 /harness diff <run-id>
 /harness apply <run-id>
 ```
+
+用户只需描述任务，不必先选择算法、角色或路线。新建 product 任务默认使用 `auto`：先明确要求和评估标准，再判断是否值得比较多个方案。
 
 `run` 默认使用当前 OMP 模型；该模型必须属于受支持的 direct API provider。CLI 需要明确指定 `--model provider/model`。模型别名、模糊匹配和自动 fallback 被禁用。
 
@@ -54,23 +56,31 @@ bun /absolute/path/to/omp-harness2/src/cli.ts --workspace /path/to/repo run \
 
 ## 当前行为
 
-- **完整 k=1 流程**：baseline → INV/DOM 提议 → 两个 probe → Compose → final → product 选择 → Reflection。
-- **独立起点**：四个 solver 从同一 Git dirty/untracked 文件快照开始；各自使用新 OMP 进程。
-- **独立提议**：INV 与 DOM 只能看到 baseline 证据和相同的历史经验快照。
-- **受控工具**：关闭 OMP 原生工具和自动发现，只通过 host-owned 文件工具访问任务副本；editor/selector/reflector 只读。
-- **声明式 harness**：prompt append、tool guidance 和只读、按需加载的 skills；不执行生成的脚本或 TS extension。
-- **可恢复记录**：持久化阶段、配置、事件、费用预留、候选和选定产物指纹。恢复跳过已完成阶段；未知费用保留完整阶段预算。
-- **明确应用**：结果完成后先查看 diff，再显式 apply。应用时重新校验源工作区和产物指纹，拒绝覆盖漂移；重复 apply 幂等。
-- **经验库**：每个项目按 domain/model 分区，引用 baseline 与候选执行证据；无可用经验则不入库。反思失败不会丢弃已经采纳的产物。
+- **按任务选择流程**：`auto` 先记录决策理由与结构化标准。明确、简单的任务走直接完成；有实质性方案差异的任务才进入探索。
+- **直接完成**：auto 判断后执行 baseline → select，生成一个产物并按冻结标准审阅。显式 `--strategy direct` 使用本地生成的任务约束标准，跳过付费 planner 调用。
+- **探索不同方案**：plan → baseline 与 2–3 个有名称的路线 → review。没有完善需求时直接采用这次审阅的选择；需要完善时才执行一次 refine 并重新 select，最后 reflect。路线记录做法、假设与取舍，不要求合并成一个方案。
+- **基于实际产物改进**：如审阅建议继续完善，从所选候选的真实文件创建独立副本，并传入它的完整回答，最多继续一次。保留原候选与改进后的版本，最终仍可选择原结果。
+- **明确评估边界**：匿名审阅所有可采纳候选，对每项标准记录 `met`、`not_met` 或 `unknown` 及证据。`status` / `show` 展示路线、选择理由、评估方式与局限；模型判断和 fallback 都明确标注。
+- **隔离与可恢复**：初始候选从同一 Git dirty/untracked 快照开始；各阶段持久化配置、轨迹、费用预留与产物指纹。恢复复用已经完成的阶段，未知费用保留完整阶段预算。
+- **受控文件工具**：所有角色都只使用 host-owned 文件工具；审阅、规划和反思角色只读。solver 可写入私有副本。
+- **明确应用**：完成后先看 diff，再显式 apply。应用时校验源工作区及产物指纹；同一工作区的应用与恢复互斥，重复 apply 幂等。
+- **经验有范围**：探索流程可以保留带有证据、适用条件和局限的改进经验；没有可靠条目则不入库。反思失败不会丢弃已采纳产物。
 
-默认总预算为 **5 USD、30 分钟**，单阶段上限 10 分钟。总墙钟 deadline 从创建 run 时开始，暂停期间也计时；过期任务不能通过 resume 延长。参数：`--budget`、`--max-minutes`、`--stage-minutes`、`--improver-model`、`--domain`。
+默认总预算为 **5 USD、30 分钟**，单阶段上限 10 分钟。总墙钟 deadline 从创建 run 时开始，暂停期间也计时；resume 不延长 deadline。参数：`--budget`、`--max-minutes`、`--stage-minutes`、`--improver-model`、`--domain`。
 
-| 模式 | k=1 采纳规则 |
+`--strategy` 是可选覆盖项，普通使用不需要填写：
+
+| 模式与策略 | 行为 |
 | --- | --- |
-| `product`（默认） | 匿名比较 baseline/final，允许选择 baseline；无效选择响应保留 baseline |
-| `research` | 跳过 selector，采用 sole composed final，对齐所研究参考实现的该项行为 |
+| `product` + `auto`（默认） | 根据任务选择直接完成或多路线探索 |
+| `product` + `direct` | 跳过付费 planner，冻结任务约束标准后直接完成并审阅 |
+| `product` + `explore` | 明确要求比较 2–3 条不同路线，可继续完善一次 |
+| `product` + `legacy` | 保留原有 INV/DOM → Probe → Compose 流程，匿名比较 baseline/final |
+| `research` | 使用 `legacy`，采用 sole composed final；拒绝其他显式 strategy |
 
-两种模式都要求显式 apply。`research` 不是论文完整复现声明：模型、执行器、提示词和可编辑组件均存在差异。
+没有保存 `strategy` 的旧记录按 `legacy` 恢复，不会在中途换成新流程。`legacy` 中无效的选择响应保留 baseline；composed 执行失败仍会使 run 失败。`research` 与新的 product 探索流程应分开报告；它们都不是论文完整复现或性能增益声明。
+
+所有策略都需要显式 apply。当前评估是基于文件与执行记录的模型审阅；没有运行任务测试、用户研究、外部事实核查或性能实验，因此不能把评价描述成实测结果。
 
 ## 边界与已知限制
 
@@ -92,7 +102,7 @@ bun test
 bun src/cli.ts --json doctor
 ```
 
-默认测试不调用真实模型。测试覆盖完整 controller 流程、PPC 证据隔离、预算、重试/恢复、RPC 协议、host 文件权限、存储锁、工作区漂移、产物篡改、apply 回滚和幂等。
+默认测试不调用真实模型。测试验证自适应直接/探索流程、冻结标准、匿名审阅、一次延续、旧记录兼容，以及预算、取消、恢复、RPC、文件权限和 apply 保护。具体通过数和未验证层级见验证报告。
 
 真实 OMP 的额外集成检查需要本地已安装的兼容版本：`RUN_REAL_OMP_TEST=1 bun test test/real-omp.test.ts`。它使用固定、无网络的模拟 provider，覆盖实际 agent loop 与完整九阶段流程；成功不代表真实模型质量或远端 HTTP 传输已验证。实际验证记录见 [验证报告](docs/validation.md)。
 

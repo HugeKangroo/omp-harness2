@@ -1,9 +1,10 @@
-import type { Mode, RunRecord } from "./types.ts";
+import type { CandidateId, ExecutionStrategy, ExplorationEvaluation, Mode, RunRecord } from "./types.ts";
 
-export const HELP = `Harness² — evidence-driven harness optimization
+export const HELP = `Harness² — inspect, explore, and review local task results
 
   /harness run <task> [--model provider/id] [--budget USD]
       [--improver-model provider/id] [--mode product|research] [--domain NAME]
+      [--strategy auto|direct|explore|legacy]
       [--max-minutes N] [--stage-minutes N]
   /harness status [run-id]
   /harness list
@@ -14,7 +15,9 @@ export const HELP = `Harness² — evidence-driven harness optimization
   /harness apply <run-id>
   /harness doctor
 
-Runs execute in isolated workspaces. Apply is a separate, explicit action.
+Product runs automatically choose a direct approach or compare distinct routes.
+Strategy is optional; research uses legacy. Reviews report evidence and unknowns.
+Runs use isolated file workspaces. Apply is a separate, explicit action.
 Use -- before task text that contains literal flags. No shell expansion is performed.`;
 
 export interface RunOptions {
@@ -22,6 +25,7 @@ export interface RunOptions {
   improverModel?: string;
   budget?: number;
   mode?: Mode;
+  strategy?: ExecutionStrategy;
   domain?: string;
   maxMinutes?: number;
   stageMinutes?: number;
@@ -134,7 +138,7 @@ export function parseCommand(args: string[]): HarnessCommand {
     }
     const equal = arg.indexOf("=");
     const flag = equal === -1 ? arg : arg.slice(0, equal);
-    if (!["--model", "--improver-model", "--budget", "--mode", "--domain", "--max-minutes", "--stage-minutes"].includes(flag)) {
+    if (!["--model", "--improver-model", "--budget", "--mode", "--strategy", "--domain", "--max-minutes", "--stage-minutes"].includes(flag)) {
       throw new Error(`Unknown option ${flag}. Use -- before literal task text.`);
     }
     if (seen.has(flag)) throw new Error(`Duplicate option ${flag}.`);
@@ -151,6 +155,10 @@ export function parseCommand(args: string[]): HarnessCommand {
         if (value !== "product" && value !== "research") throw new Error("--mode must be product or research.");
         options.mode = value;
         break;
+      case "--strategy":
+        if (value !== "auto" && value !== "direct" && value !== "explore" && value !== "legacy") throw new Error("--strategy must be auto, direct, explore or legacy.");
+        options.strategy = value;
+        break;
       case "--domain":
         if (!value.trim() || value.length > 120 || /[\x00-\x1f\x7f]/u.test(value)) throw new Error("--domain requires a short printable name.");
         options.domain = value.trim();
@@ -160,6 +168,7 @@ export function parseCommand(args: string[]): HarnessCommand {
   const text = task.join(" ").trim();
   if (!text) throw new Error("run requires a task.");
   if (text.length > 100_000) throw new Error("Task exceeds the 100,000 character limit.");
+  if (options.mode === "research" && options.strategy !== undefined && options.strategy !== "legacy") throw new Error("Research mode requires --strategy legacy; omit --strategy to use it automatically.");
   return { kind: "run", task: text, options };
 }
 
@@ -170,6 +179,20 @@ export function parseCommandText(input: string): HarnessCommand {
 /** Strip terminal control characters from model/user-controlled display values. */
 export function safeDisplay(value: string): string {
   return value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, "").replace(/[\x00-\x08\x0b-\x1f\x7f]/gu, "");
+}
+
+function candidateLabel(record: RunRecord, id: CandidateId): string {
+  const route = record.exploration?.plan.routes.find(route => route.id === id);
+  if (route) return safeDisplay(route.name);
+  if (id === "refine") {
+    const parent = record.stages.refine?.parentStage;
+    return parent && parent !== "refine" ? `refinement of ${candidateLabel(record, parent)}` : "refined result";
+  }
+  return id;
+}
+
+function evaluationMethod(evaluation: ExplorationEvaluation): string {
+  return evaluation.method === "model_review" ? "model review of artifacts (no executed tests or performance measurements)" : "fallback (no validated model comparison)";
 }
 
 export function formatStatus(record: RunRecord): string {
@@ -184,9 +207,55 @@ export function formatStatus(record: RunRecord): string {
     `Observed cost: $${cost.toFixed(4)} / $${record.config.maxCostUsd.toFixed(2)}`,
   ];
   if (accountedCost > cost || reservedCost > 0) lines.push(`Budget charged: $${accountedCost.toFixed(4)}; reserved: $${reservedCost.toFixed(4)}`);
-  if (record.winner) lines.push(`Selected result: ${record.winner}`);
+  lines.push(`Strategy: ${record.config.strategy ?? "legacy"}`);
+  if (record.exploration) {
+    const { plan, review, selection } = record.exploration;
+    lines.push(`Approach: ${plan.decision === "direct" ? "direct" : "explore distinct routes"} — ${safeDisplay(plan.reason)}`);
+    if (plan.routes.length) lines.push(`Routes: ${plan.routes.map(route => safeDisplay(route.name)).join("; ")}`);
+    const evaluation = selection ?? review;
+    if (evaluation) {
+      lines.push(`Evaluation: ${evaluationMethod(evaluation)}`);
+      const unknowns = evaluation.assessments.reduce((count, assessment) => count + assessment.criteria.filter(criterion => criterion.verdict === "unknown").length, 0);
+      if (unknowns) lines.push(`Unknown: ${unknowns} criterion assessments remain unverified.`);
+      if (!record.selectionReason) lines.push(`${selection ? "Selection" : "Review"}: ${safeDisplay(evaluation.reason)}`);
+      for (const limitation of evaluation.limitations) lines.push(`Limitation: ${safeDisplay(limitation)}`);
+    }
+  }
+  if (record.winner) lines.push(`Selected result: ${candidateLabel(record, record.winner)}`);
+  if (record.selectionReason) lines.push(`Selection: ${safeDisplay(record.selectionReason)}`);
   if (record.error) lines.push(`Error: ${safeDisplay(record.error)}`);
   for (const warning of record.warnings ?? []) lines.push(`Warning: ${safeDisplay(warning)}`);
   if (record.status === "completed") lines.push(`Preview /harness diff ${record.id}; apply /harness apply ${record.id}`);
+  return lines.join("\n");
+}
+
+/** Shared human-readable inspection for the CLI and OMP command. */
+export function formatShow(record: RunRecord): string {
+  const lines = [formatStatus(record), `Model: ${record.config.model}`, `Mode: ${record.config.mode}`, `Task: ${safeDisplay(record.task)}`];
+  if (record.winner) {
+    const response = record.stages[record.winner]?.result?.text;
+    if (response) lines.push("", "Selected response:", safeDisplay(response));
+  }
+  if (record.exploration) {
+    const { plan, review, selection } = record.exploration;
+    lines.push("", "Frozen criteria:", ...plan.criteria.map(criterion => `${safeDisplay(criterion.id)} [${criterion.kind}]: ${safeDisplay(criterion.description)}`));
+    for (const route of plan.routes) {
+      lines.push("", `Route: ${safeDisplay(route.name)}`, `Approach: ${safeDisplay(route.approach)}`);
+      if (route.assumptions.length) lines.push(`Assumptions: ${route.assumptions.map(safeDisplay).join("; ")}`);
+      if (route.tradeoffs.length) lines.push(`Tradeoffs: ${route.tradeoffs.map(safeDisplay).join("; ")}`);
+    }
+    for (const [name, evaluation] of [["Review", review], ["Final evaluation", selection]] as const) {
+      if (!evaluation) continue;
+      lines.push("", `${name}: ${evaluationMethod(evaluation)}`, `Reason: ${safeDisplay(evaluation.reason)}`);
+      for (const assessment of evaluation.assessments) {
+        lines.push(`Candidate: ${candidateLabel(record, assessment.candidate)}`);
+        for (const criterion of assessment.criteria) lines.push(`  ${safeDisplay(criterion.criterionId)}: ${criterion.verdict} — ${safeDisplay(criterion.evidence)}`);
+        if (assessment.strengths.length) lines.push(`  Strengths: ${assessment.strengths.map(safeDisplay).join("; ")}`);
+        if (assessment.weaknesses.length) lines.push(`  Weaknesses: ${assessment.weaknesses.map(safeDisplay).join("; ")}`);
+      }
+      for (const limitation of evaluation.limitations) lines.push(`Limitation: ${safeDisplay(limitation)}`);
+      if (evaluation.refinement) lines.push(`Suggested refinement of ${candidateLabel(record, evaluation.refinement.candidate)}: ${safeDisplay(evaluation.refinement.instructions)}`);
+    }
+  }
   return lines.join("\n");
 }

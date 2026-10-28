@@ -4,7 +4,8 @@ import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LibraryStore, RunLockedError, RunStore, StoreConflictError, StoreCorruptionError } from "../src/store.ts";
-import type { LibraryEntry, RunRecord } from "../src/types.ts";
+import { fallbackEvaluation } from "../src/exploration.ts";
+import type { ExplorationPlan, LibraryEntry, RunRecord, StageId, StageRecord } from "../src/types.ts";
 
 const temporary: string[] = [];
 async function directory(): Promise<string> { const root = await mkdtemp(join(tmpdir(), "harness2-store-")); temporary.push(root); return root; }
@@ -21,6 +22,26 @@ function record(id = "run-1"): RunRecord {
 function entry(id = "lesson-1"): LibraryEntry {
   return { schemaVersion: 1, id, runId: "run-1", domain: "../../code", model: "provider/model", createdAt: "2026-01-01T00:00:00.000Z", harness: record().baseHarness,
     lesson: { cue: "parser tasks", lesson: "exercise malformed inputs", evidence: ["baseline failed a malformed input"], confidence: "medium", limitations: "one task" } };
+}
+function completedStage(id: StageId, artifactHash = "a".repeat(64)): StageRecord {
+  return { id, status: "completed", attempt: 1, cwd: `/tmp/${id}`, startedAt: "2026-01-01T00:00:00Z", artifactHash,
+    result: { text: "done", status: "completed", usage: { inputTokens: 1, outputTokens: 1, costUsd: 0.1 }, startedAt: "2026-01-01T00:00:00Z", endedAt: "2026-01-01T00:00:01Z", eventsPath: `/tmp/${id}/events.jsonl` } };
+}
+function adaptiveRecord(): RunRecord {
+  const plan: ExplorationPlan = { decision: "explore", reason: "Compare distinct approaches.",
+    criteria: [{ id: "task", description: "Fulfill the requested task.", kind: "requirement" }],
+    routes: [
+      { id: "route_1", name: "Focused change", approach: "Repair in place.", assumptions: [], tradeoffs: [] },
+      { id: "route_2", name: "New representation", approach: "Use a simpler structure.", assumptions: [], tradeoffs: [] },
+    ] };
+  const review = fallbackEvaluation(plan, ["baseline", "route_1", "route_2"], "route_1", "Conservative review fallback.");
+  review.method = "model_review";
+  review.refinement = { candidate: "route_1", instructions: "Clarify the handling of edge cases." };
+  const selection = fallbackEvaluation(plan, ["baseline", "route_1", "route_2", "refine"], "refine", "Conservative selection fallback.");
+  return { ...record(), config: { ...record().config, strategy: "auto" }, status: "completed", winner: "refine",
+    exploration: { plan, review, selection },
+    stages: { baseline: completedStage("baseline"), route_1: completedStage("route_1"), route_2: completedStage("route_2"),
+      refine: { ...completedStage("refine", "b".repeat(64)), parentStage: "route_1", parentArtifactHash: "a".repeat(64) } } };
 }
 
 describe("RunStore", () => {
@@ -177,6 +198,68 @@ describe("RunStore", () => {
     }
     await writeFile(file, JSON.stringify({ ...valid, warnings: [], stages: { baseline: { ...stage, observedCostUsd: 0.25, result: { ...result, usageEstimated: false } } } }));
     expect((await store.get("run-1"))?.stages.baseline?.result?.usageEstimated).toBe(false);
+  });
+
+  test("persists adaptive evidence and lineage while preserving legacy and parse-boundary records", async () => {
+    const store = new RunStore(await directory());
+    const adaptive = adaptiveRecord();
+    expect(await store.create(adaptive)).toEqual(adaptive);
+    expect(await store.get(adaptive.id)).toEqual(adaptive);
+    const legacy = { ...record("legacy"), config: { ...record().config, strategy: "legacy" as const } };
+    expect(await store.create(legacy)).toEqual(legacy);
+    expect((await store.create(record("older"))).config.strategy).toBeUndefined();
+    const planPending = { ...record("plan-pending"), config: { ...record().config, strategy: "auto" as const }, stages: { plan: completedStage("plan") } };
+    expect(await store.create(planPending)).toEqual(planPending);
+    const reviewPending = adaptiveRecord(); reviewPending.id = "review-pending"; reviewPending.status = "running";
+    delete reviewPending.winner; delete reviewPending.exploration!.review; delete reviewPending.exploration!.selection; delete reviewPending.stages.refine;
+    reviewPending.stages.review = completedStage("review");
+    expect(await store.create(reviewPending)).toEqual(reviewPending);
+    const refinePending = adaptiveRecord(); refinePending.id = "refine-pending"; refinePending.status = "running";
+    delete refinePending.winner; delete refinePending.exploration!.selection;
+    expect(await store.create(refinePending)).toEqual(refinePending);
+    await store.appendEvent({ schemaVersion: 1, runId: adaptive.id, timestamp: adaptive.createdAt, type: "stage", stage: "route_1", message: "Route completed" });
+    expect((await store.events(adaptive.id))[0]!.stage).toBe("route_1");
+  });
+
+  test("rejects tampered adaptive strategies, plans, candidate coverage, winners, and lineage", async () => {
+    const store = new RunStore(await directory()); await store.create(adaptiveRecord());
+    const file = join(store.runDir("run-1"), "run.json");
+    const mutations: Array<(run: RunRecord) => void> = [
+      run => { (run.config as unknown as Record<string, unknown>).strategy = ["auto"]; },
+      run => { delete run.config.strategy; },
+      run => { run.config.strategy = "legacy"; },
+      run => { run.config.strategy = "direct"; },
+      run => { run.config.mode = "research"; },
+      run => { delete run.exploration; },
+      run => { delete run.exploration!.selection; },
+      run => { delete run.exploration!.review; },
+      run => { delete run.exploration!.review!.refinement; },
+      run => { run.exploration!.review!.winner = "route_2"; run.exploration!.review!.refinement!.candidate = "route_2"; },
+      run => { (run.exploration as unknown as Record<string, unknown>).permissions = {}; },
+      run => { run.exploration!.plan.routes[1]!.name = "Focused change"; },
+      run => { run.stages.route_3 = completedStage("route_3"); },
+      run => { run.exploration!.review!.assessments.pop(); },
+      run => { run.exploration!.selection!.assessments.pop(); },
+      run => { run.exploration!.selection!.assessments[0]!.criteria[0]!.criterionId = "invented"; },
+      run => { run.exploration!.selection!.assessments[0]!.criteria[0]!.verdict = "met"; },
+      run => { run.exploration!.selection!.winner = "route_3"; },
+      run => { run.exploration!.selection!.winner = null; },
+      run => { run.winner = "baseline"; },
+      run => { run.winner = "route_3"; },
+      run => { (run as unknown as Record<string, unknown>).winner = ["refine"]; },
+      run => { run.exploration!.selection!.method = "model_review"; run.exploration!.selection!.refinement = { candidate: "refine", instructions: "Refine again" }; },
+      run => { delete run.stages.refine!.parentStage; },
+      run => { delete run.stages.refine!.parentArtifactHash; },
+      run => { run.stages.refine!.parentArtifactHash = "c".repeat(64); },
+      run => { run.stages.refine!.parentStage = "refine"; },
+      run => { run.stages.refine!.parentStage = "route_3"; },
+      run => { run.stages.route_1!.status = "failed"; },
+    ];
+    for (const mutate of mutations) {
+      const run = adaptiveRecord(); mutate(run);
+      await writeFile(file, JSON.stringify(run));
+      await expect(store.get("run-1")).rejects.toBeInstanceOf(StoreCorruptionError);
+    }
   });
 });
 

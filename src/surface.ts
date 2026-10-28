@@ -60,7 +60,7 @@ export function parseSelection(response: string): { winner: "baseline" | "final"
   return { winner: v.winner, reason: text(v.reason, "selection reason", 4_000, true) };
 }
 
-export function parseLesson(response: string, stages: readonly string[]): Lesson | undefined {
+export function parseLesson(response: string, stages: readonly string[], candidateStages?: readonly string[]): Lesson | undefined {
   const v = object(parseJsonResponse(response));
   if (v.noEntry === true && Object.keys(v).length === 1) return undefined;
   if (typeof v.confidence !== "string" || !["low", "medium", "high"].includes(v.confidence)) throw new ValidationError("Invalid lesson confidence");
@@ -68,7 +68,9 @@ export function parseLesson(response: string, stages: readonly string[]): Lesson
     throw new ValidationError("Lesson evidence must reference completed stages");
   }
   const cited = new Set(v.evidence as string[]);
-  if (!cited.has("baseline") || !["inv_probe", "dom_probe", "final"].some(id => cited.has(id))) {
+  if (candidateStages !== undefined) {
+    if ([...cited].filter(id => candidateStages.includes(id)).length < 2) throw new ValidationError("A durable lesson requires two distinct candidate execution references");
+  } else if (!cited.has("baseline") || !["inv_probe", "dom_probe", "final"].some(id => cited.has(id))) {
     throw new ValidationError("A durable lesson requires baseline and candidate execution evidence");
   }
   return {

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { HarnessController } from "./controller.ts";
 import { runDoctor } from "./doctor.ts";
 import { renderDiff } from "./diff.ts";
-import { HELP, formatStatus, parseCommand, safeDisplay, type RunOptions } from "./commands.ts";
+import { HELP, formatShow, formatStatus, parseCommand, safeDisplay, type RunOptions } from "./commands.ts";
 import type { RunConfig, RunRecord } from "./types.ts";
 
 interface CliOptions { workspace: string; storeRoot?: string; json: boolean; args: string[] }
@@ -32,13 +32,14 @@ function cliOptions(argv: string[]): CliOptions {
   return { workspace, storeRoot, json, args: argv.slice(index) };
 }
 
-function runConfig(options: RunOptions): Partial<RunConfig> & { model: string } {
+export function runConfig(options: RunOptions): Partial<RunConfig> & { model: string } {
   if (!options.model) throw new Error("--model provider/model is required. In OMP, /harness uses the current model by default.");
   return {
     model: options.model,
     ...(options.improverModel === undefined ? {} : { improverModel: options.improverModel }),
     ...(options.budget === undefined ? {} : { maxCostUsd: options.budget }),
     ...(options.mode === undefined ? {} : { mode: options.mode }),
+    ...(options.strategy === undefined ? {} : { strategy: options.strategy }),
     ...(options.domain === undefined ? {} : { domain: options.domain }),
     ...(options.maxMinutes === undefined ? {} : { maxDurationMs: Math.round(options.maxMinutes * 60_000) }),
     ...(options.stageMinutes === undefined ? {} : { stageTimeoutMs: Math.round(options.stageMinutes * 60_000) }),
@@ -68,16 +69,6 @@ async function startWorker(record: RunRecord, controller: HarnessController, res
   } finally {
     closeSync(log);
   }
-}
-
-function showRun(record: RunRecord): string {
-  const lines = [formatStatus(record), `Model: ${record.config.model}`, `Mode: ${record.config.mode}`, `Task: ${safeDisplay(record.task)}`];
-  if (record.selectionReason) lines.push(`Selection: ${safeDisplay(record.selectionReason)}`);
-  if (record.winner) {
-    const text = record.stages[record.winner]?.result?.text;
-    if (text) lines.push("", "Selected response:", safeDisplay(text));
-  }
-  return lines.join("\n");
 }
 
 export async function runCli(argv: string[]): Promise<void> {
@@ -138,7 +129,7 @@ export async function runCli(argv: string[]): Promise<void> {
     case "show": {
       const record = await controller.get(command.id);
       if (!record) throw new Error(`Run ${command.id} was not found.`);
-      output(record, showRun(record)); return;
+      output(record, formatShow(record)); return;
     }
     case "cancel":
       await controller.cancel(command.id);
