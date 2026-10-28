@@ -20,7 +20,9 @@ OMP RPC 使用换行分隔的 JSON 协议，不是 JSON-RPC 2.0。runner 必须�
 
 ```mermaid
 flowchart TD
-    U[OMP 用户命令] --> P[插件入口]
+    U[OMP 普通对话] --> M[主代理任务工具]
+    M --> P[插件入口与会话绑定]
+    H[高级手动命令] --> P
     P --> C[持久化 Controller]
     C --> S[输入快照与 Bundle]
     C --> R[RPC Runner]
@@ -30,9 +32,21 @@ flowchart TD
     C --> L[改进经验库]
     L --> C
     C --> A[选定结果]
-    A --> D[显式 Apply]
+    A --> D[预览与人工确认 Apply]
     D --> F[主工作区]
 ```
+
+## 对话入口与会话边界
+
+`src/conversation-extension.ts` 为主 OMP 会话注册 `harness_task`（`start`、`inspect`、`cancel`、`resume`、`preview`）和独立的 `harness_apply`。主代理根据用户任务选择是否交接，不接管每条输入。新建任务使用 product 模式，默认 `auto`；现有 `/harness` 与 CLI 保留高级手动操作。主代理和受限 worker 的工具权限不同：worker 不加载此扩展，不能递归调用这些入口。
+
+交接文本包含明确任务及主代理选择的相关讨论、约束，不自动复制完整会话。`buildHandoff` 严格校验字段和长度，总量最多 50,000 字符；参考上下文通过明确的不可信数据边界传入。`start` 创建持久化 run、启动后台 controller 后立即返回 run ID，不等待阶段执行结束。调用方不应重复轮询或在前台重做相同任务。
+
+`src/conversation.ts` 从 `ctx.sessionManager.getBranch()` 的当前祖先链读取 `pi.appendEntry` 写入的记录：`omp-harness2.binding` 绑定 run ID、工作区与原始用户消息，`omp-harness2.preview` 保存预览 token 和摘要，`omp-harness2.delivery` 记录完成消息派发。用户消息必须是非 synthetic、归属非 agent 的真实 user 消息，工具结果与 custom message 不算新用户任务。解析器校验祖先关系、字段及绑定顺序；其他分支记录不会因全局 run 存在而取得对话权限。
+
+操作保存会话 ID、工作区、祖先锚点与切换代数，在异步边界重新检查。新用户消息可以继续操作当前分支已有任务；切换到不含锚点的分支或更换工作区使旧操作失效。生命周期事件清理旧 watcher，并为当前分支最近 20 个绑定重新连接。controller 的持久化运行独立于 watcher，关闭会话不等于取消运行。
+
+后台达到终态后，watcher 等待 `isIdle()` 为真且 `hasPendingMessages()` 为假，再向当前匹配分支交回结果，避免让 OMP 的共享 follow-up 队列把旧结果带到另一分支。完成消息及路由指导显式归属 agent，完成通知后不能自动再启动新任务；需要新的真实用户输入。通知派发前先记 receipt，避免普通重连重复发送，但 OMP `sendMessage` 无送达回执，因此该机制不承诺可靠或恰好一次交付。忙碌、headless 或缺少空闲状态接口时可能延后；中断也可能留下已派发但未显示的记录。运行始终可以通过主动检查读取。
 
 ## 稳定控制层与可编辑面
 
@@ -111,7 +125,8 @@ flowchart TD
 
 | 模块 | 职责 | 不应承担的职责 |
 | --- | --- | --- |
-| OMP extension | 注册命令，展示状态、结果与错误，转发取消 | 长时间阻塞生命周期 hook |
+| OMP extension | 注册对话工具与命令，展示状态、结果与错误，转发取消 | 长时间阻塞生命周期 hook |
+| Conversation adapter | 分支绑定、有限上下文交接、后台交回、预览与实际 UI 确认 | 复制完整会话、自动处理所有输入或替用户批准 |
 | Controller | 阶段状态机、预算、恢复、采纳策略 | 直接把 LLM 文本当作可执行控制流 |
 | Snapshot manager | 冻结输入、指纹、建立独立运行目录 | 把前次 probe 的修改带入下一次 |
 | Harness compiler | 校验 bundle，转成明确的 OMP 启动资源 | 修改用户全局配置 |
@@ -178,6 +193,8 @@ legacy product 对完成的 baseline/final 匿名比较，选择格式无效时�
 
 apply 消费已经选定的产物。它验证目标路径属于允许范围、产物内容与记录一致、主工作区指纹仍匹配输入快照，再执行修改。检测到漂移、路径越界或不支持的文件类型时拒绝应用，保留可审阅差异。
 
+对话入口先执行 preview，保存随机 token 与 `reviewDigest`。摘要覆盖 run、工作区、快照、winner、产物指纹、回答、plan、selection 和完整变更清单；普通记录 revision 变化不会无故使预览失效。`harness_apply` 只接收 run ID 与 token，没有模型可填写的批准标记。它重新读取差异、核验摘要，调用 `ctx.ui.confirm` 展示真实 OMP 确认框，确认后再次核验。controller 在应用锁内核验预期摘要，并在最后一个异步等待之后、同步工作区事务之前检查会话、取消信号与当前预览 token。用户说“采用”仍需这一步 UI 确认。没有交互 UI 时拒绝工具应用，提示用户显式使用 `/harness apply`；原有手动入口保留独立的显式操作语义。
+
 当前 apply 层处理添加、修改、删除的变更清单，并使用逐文件原子替换、备份与 journal；RPC host 工具本身没有删除工具，只生成 UTF-8 文件写入。应用不提供整棵目录或断电级原子性；文件/目录类型互换、符号链接等不支持的情况明确拒绝。多文件修改失败必须报告并处理部分应用，不能静默丢失变更。
 
 ## 经验边界
@@ -188,6 +205,8 @@ apply 消费已经选定的产物。它验证目标路径属于允许范围、�
 
 ## 验证重点
 
+- 验证真实用户来源、当前分支绑定、异步操作遇到会话切换、完成通知防递归及重连去重；通知无回执的限制单列。
+- 验证对话 apply 必须有最新预览及真实 UI 确认，拒绝无 UI、自报批准、旧 token、产物变化与会话切换。
 - 用假 runner 验证直接完成、多路线探索、可选一次完善、legacy 和 research 状态机，避免测试依赖付费推理。
 - 验证简单任务不会无必要分支、标准先冻结、路线存在实质差异、匿名审阅覆盖全部候选、未知/fallback 明确呈现。
 - 验证 refine 确实继承被选产物的文件与父指纹、不会覆盖原版本，且只允许一次。

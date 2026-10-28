@@ -202,6 +202,7 @@ test("extension registers a local command, renders help without a turn, and reje
   const messages: Array<{ content: string; triggerTurn?: boolean }> = [];
   const notifications: string[] = [];
   harnessExtension({
+    registerTool() {}, on() {},
     registerCommand(name, command) { expect(name).toBe("harness"); handler = command.handler; },
     appendEntry() {},
     sendMessage(message, options) { messages.push({ content: message.content, triggerTurn: options?.triggerTurn }); },

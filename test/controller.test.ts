@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { HarnessController, accountedCost } from "../src/controller.ts";
+import { reviewDigest } from "../src/conversation.ts";
 import type { Runner, WorkerRequest, WorkerResult } from "../src/types.ts";
 
 const roots: string[] = [];
@@ -55,6 +56,32 @@ class FakeRunner implements Runner {
 }
 
 describe("durable Harness² controller", () => {
+  test("apply checks the approved review inside the run lease before writing", async () => {
+    const root = fixture(); const runner = new FakeRunner();
+    const controller = new HarnessController({ workspace: root, runner });
+    const created = await controller.create("Change the constant", { model: "test/model", strategy: "legacy" });
+    const completed = await controller.execute(created.id);
+    const digest = reviewDigest(completed, await controller.diff(created.id));
+    // Simulate a newly reviewed answer after the UI displayed the old artifact.
+    completed.stages.final!.result!.text = "An updated selected response that the user has not reviewed.";
+    await controller.store.save(completed, completed.revision);
+    await expect(controller.apply(created.id, digest)).rejects.toThrow("changed after review");
+    expect(readFileSync(path.join(root, "src/value.ts"), "utf8")).toContain("initial");
+    const current = (await controller.get(created.id))!;
+    const fresh = reviewDigest(current, await controller.diff(created.id));
+    const appendEvent = controller.store.appendEvent.bind(controller.store);
+    let allowed = true;
+    controller.store.appendEvent = async event => {
+      await appendEvent(event);
+      if (event.type === "apply_started") allowed = false;
+    };
+    await expect(controller.apply(created.id, fresh, () => { if (!allowed) throw new Error("Conversation changed before commit"); })).rejects.toThrow("before commit");
+    expect(readFileSync(path.join(root, "src/value.ts"), "utf8")).toContain("initial");
+    controller.store.appendEvent = appendEvent;
+    expect((await controller.apply(created.id, fresh)).applied).toBe(true);
+    expect((await controller.apply(created.id, fresh)).alreadyApplied).toBe(true);
+  });
+
   test("records predating strategy keep the legacy pipeline and research rejects adaptive overrides", async () => {
     const root = fixture(); const runner = new FakeRunner();
     const controller = new HarnessController({ workspace: root, runner });

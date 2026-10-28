@@ -1,6 +1,6 @@
 # omp-harness2
 
-面向 Oh My Pi 的本地任务插件：提交一次自然语言任务，系统判断直接完成还是探索不同方案，依据预先确定的标准审阅实际产物，交付可查看、可应用的结果。适用于仓库内的代码修改、文稿、方案和其他文本文件任务。
+面向 Oh My Pi 的本地任务插件：在普通对话中描述任务，由主代理在适合时交给后台 Harness²。系统判断直接完成还是探索不同方案，依据预先确定的标准审阅实际产物，完成后交回当前会话。适用于仓库内的代码修改、文稿、方案和其他文本文件任务。
 
 **状态：`0.1.0-alpha.1`，产品基础实现，尚未达到面向日常使用的发布门槛。** 当前支持固定、受限的 OMP 文件编辑 profile；它不等于用户完整的原生 OMP 配置。没有声称复现论文的性能增益。
 
@@ -24,28 +24,33 @@ omp -e /absolute/path/to/omp-harness2/src/extension.ts
 
 Worker 只接收显式 API key 环境变量，例如 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`；也支持 `HARNESS2_API_KEY`。不复制 OMP 登录数据库，不继承 OAuth/订阅登录。不同 improver/executor provider 应分别设置其 API key，而不要使用一个通用 key。
 
+然后继续普通对话，例如：
+
+> 为这个项目写一份简洁的入门说明。沿用刚才确定的新手读者和部署方式，完成后给我看结果。
+
+主代理用 `harness_task` 交接明确任务、相关讨论与约束，立即返回 run ID，后台继续执行。主代理不需要重复轮询，也不应同时再做一遍已交出的工作。新任务默认使用 `auto`，不必先选择算法、角色或路线；这也不会把每条聊天消息都自动转成 Harness² 任务。
+
+完成后，插件等待主会话空闲且没有待处理消息，再把结果交回仍包含原交接记录的当前会话分支。可以继续说“看看差异”“取消这个任务”或“采用这个结果”。采用时先生成预览，再通过 OMP 的真实确认框批准应用；自然语言表达采用意愿后仍有这一步 UI 确认。模型不能通过 `approved: true` 一类参数自行批准。没有交互 UI 时，需要用户显式运行 `/harness apply <run-id>`。
+
+默认使用当前 OMP 模型；该模型必须属于受支持的 direct API provider。模型别名、模糊匹配和自动 fallback 被禁用。无需为本插件另行开启 OMP 的 `learn` 或 `autolearn`。
+
+### 高级与手动操作
+
+原有命令保留，用于手动启动、检查和恢复：
+
 ```text
 /harness run 为这个项目写一份简洁的入门说明 --model openai/gpt-4.1 --budget 5
 /harness status
+/harness list
 /harness show <run-id>
 /harness diff <run-id>
 /harness apply <run-id>
-```
-
-用户只需描述任务，不必先选择算法、角色或路线。新建 product 任务默认使用 `auto`：先明确要求和评估标准，再判断是否值得比较多个方案。
-
-`run` 默认使用当前 OMP 模型；该模型必须属于受支持的 direct API provider。CLI 需要明确指定 `--model provider/model`。模型别名、模糊匹配和自动 fallback 被禁用。
-
-其他操作：
-
-```text
-/harness list
 /harness cancel <run-id>
 /harness resume <run-id>
 /harness doctor
 ```
 
-CLI 提供同样的命令，例如：
+CLI 提供同样的命令，需要明确指定 `--model provider/model`，例如：
 
 ```sh
 bun /absolute/path/to/omp-harness2/src/cli.ts --workspace /path/to/repo run \
@@ -56,6 +61,7 @@ bun /absolute/path/to/omp-harness2/src/cli.ts --workspace /path/to/repo run \
 
 ## 当前行为
 
+- **对话交接**：主代理可以启动、检查、取消、恢复和预览当前会话分支绑定的运行；只交接选定任务与相关上下文，不复制整段会话。后台通知作为代理消息，不会被当作新的用户任务再次启动。
 - **按任务选择流程**：`auto` 先记录决策理由与结构化标准。明确、简单的任务走直接完成；有实质性方案差异的任务才进入探索。
 - **直接完成**：auto 判断后执行 baseline → select，生成一个产物并按冻结标准审阅。显式 `--strategy direct` 使用本地生成的任务约束标准，跳过付费 planner 调用。
 - **探索不同方案**：plan → baseline 与 2–3 个有名称的路线 → review。没有完善需求时直接采用这次审阅的选择；需要完善时才执行一次 refine 并重新 select，最后 reflect。路线记录做法、假设与取舍，不要求合并成一个方案。
@@ -63,7 +69,7 @@ bun /absolute/path/to/omp-harness2/src/cli.ts --workspace /path/to/repo run \
 - **明确评估边界**：匿名审阅所有可采纳候选，对每项标准记录 `met`、`not_met` 或 `unknown` 及证据。`status` / `show` 展示路线、选择理由、评估方式与局限；模型判断和 fallback 都明确标注。
 - **隔离与可恢复**：初始候选从同一 Git dirty/untracked 快照开始；各阶段持久化配置、轨迹、费用预留与产物指纹。恢复复用已经完成的阶段，未知费用保留完整阶段预算。
 - **受控文件工具**：所有角色都只使用 host-owned 文件工具；审阅、规划和反思角色只读。solver 可写入私有副本。
-- **明确应用**：完成后先看 diff，再显式 apply。应用时校验源工作区及产物指纹；同一工作区的应用与恢复互斥，重复 apply 幂等。
+- **明确应用**：对话入口先生成与产物、选择和差异绑定的预览 token，再通过真实 OMP UI 确认。应用时重新校验预览、源工作区及产物指纹；同一工作区的应用与恢复互斥，重复 apply 幂等。高级手动入口保留显式 `/harness apply`。
 - **经验有范围**：探索流程可以保留带有证据、适用条件和局限的改进经验；没有可靠条目则不入库。反思失败不会丢弃已采纳产物。
 
 默认总预算为 **5 USD、30 分钟**，单阶段上限 10 分钟。总墙钟 deadline 从创建 run 时开始，暂停期间也计时；resume 不延长 deadline。参数：`--budget`、`--max-minutes`、`--stage-minutes`、`--improver-model`、`--domain`。
@@ -93,6 +99,7 @@ bun /absolute/path/to/omp-harness2/src/cli.ts --workspace /path/to/repo run \
 7. apply 使用逐文件原子替换、备份和 journal，可恢复进程中断；不承诺整棵文件树或断电级原子性。文件与目录类型互换暂时拒绝。
 8. 经验只是一次执行对照支持的假设；结构校验不能证明因果正确性或自动识别所有任务专属内容。尚无经验晋升、淘汰和跨项目共享流程。
 9. 正常取消/超时清理进程组，并保存 worker 归属记录。恢复时若旧进程组仍存活、权限不足或归属记录无效，会拒绝启动重复 worker。controller 遭 `SIGKILL` 后的自动孤儿回收仍是发布前检查项；费用预留和 worker deadline 不等同于完整回收。
+10. 对话通知是尽力交付：重启或切换会话后重新连接当前分支最近的绑定，忙碌会话、headless 或不提供空闲状态的运行环境可能延迟自动交回。插件先记录派发再调用 OMP 的无回执消息接口，因此中断可能丢失通知；运行记录仍可通过检查工具或 `show` 查看。切到不含原交接记录的分支不会接收该任务的完成通知。
 
 ## 开发与验证
 
@@ -102,7 +109,7 @@ bun test
 bun src/cli.ts --json doctor
 ```
 
-默认测试不调用真实模型。测试验证自适应直接/探索流程、冻结标准、匿名审阅、一次延续、旧记录兼容，以及预算、取消、恢复、RPC、文件权限和 apply 保护。具体通过数和未验证层级见验证报告。
+默认测试不调用真实模型。测试验证对话绑定、分支切换、预览与确认，自适应直接/探索流程、冻结标准、匿名审阅、一次延续、旧记录兼容，以及预算、取消、恢复、RPC、文件权限和 apply 保护。具体通过数和未验证层级见验证报告。
 
 真实 OMP 的额外集成检查需要本地已安装的兼容版本：`RUN_REAL_OMP_TEST=1 bun test test/real-omp.test.ts`。它使用固定、无网络的模拟 provider，覆盖实际 agent loop 与完整九阶段流程；成功不代表真实模型质量或远端 HTTP 传输已验证。实际验证记录见 [验证报告](docs/validation.md)。
 
@@ -113,6 +120,7 @@ bun src/cli.ts --json doctor
 | 文件 | 职责 |
 | --- | --- |
 | `src/extension.ts`、`src/cli.ts` | OMP 交互与后台控制进程 |
+| `src/conversation-extension.ts`、`src/conversation.ts` | 对话工具、会话绑定、完成交回与预览确认 |
 | `src/controller.ts` | 持久化阶段调度、预算与采纳 |
 | `src/runner.ts`、`src/host-tools.ts` | OMP RPC、工具边界和进程生命周期 |
 | `src/workspace.ts` | 输入快照、差异、应用与恢复 |

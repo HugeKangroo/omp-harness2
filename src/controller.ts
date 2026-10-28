@@ -8,6 +8,7 @@ import { proposalPrompt, composePrompt, selectorPrompt, reflectionPrompt } from 
 import { directPlan, parseExplorationPlan, parseExplorationEvaluation, fallbackEvaluation } from "./exploration.ts";
 import { planningPrompt, taskPrompt, evaluationPrompt, explorationReflectionPrompt } from "./exploration-prompts.ts";
 import { CANDIDATE_IDS } from "./types.ts";
+import { reviewDigest } from "./conversation.ts";
 import { OmpRpcRunner } from "./runner.ts";
 import type { ApplyResult, CandidateId, ExplorationEvaluation, Change, HarnessBundle, RunConfig, RunEvent, RunRecord, Runner, StageId, WorkerRequest } from "./types.ts";
 
@@ -501,14 +502,18 @@ export class HarnessController {
     if (!["completed", "applied"].includes(record.status) || !record.snapshot || !record.winner) throw new Error("Run has no completed adopted artifact");
     return this.verifiedChanges(record, record.winner);
   }
-  async apply(id: string): Promise<ApplyResult> {
+  async apply(id: string, expectedReviewDigest?: string, beforeCommit?: () => void): Promise<ApplyResult> {
     await this.required(id);
     const release = await this.store.acquire(id);
     try {
       const record = await this.required(id);
       if (!["completed", "applied"].includes(record.status) || !record.snapshot || !record.winner) throw new Error("Only completed adopted artifacts can be applied");
-      this.verifiedChanges(record, record.winner);
+      const changes = this.verifiedChanges(record, record.winner);
+      if (expectedReviewDigest !== undefined && reviewDigest(record, changes) !== expectedReviewDigest) throw new Error("The selected result changed after review; preview and confirm it again.");
       await this.event(record, "apply_started", "Checking source drift before applying adopted artifact");
+      // Session/approval guards run after the final await and immediately before
+      // the synchronous workspace transaction, including time spent acquiring locks.
+      beforeCommit?.();
       const result = applyWorkspace(record.snapshot, record.stages[record.winner]!.cwd);
       record.status = "applied";
       record.appliedAt ??= new Date().toISOString();

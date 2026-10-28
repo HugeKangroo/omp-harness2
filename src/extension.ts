@@ -2,20 +2,13 @@ import { fileURLToPath } from "node:url";
 import { HarnessController } from "./controller.ts";
 import { HELP, formatShow, formatStatus, parseCommandText, safeDisplay, type HarnessCommand, type RunOptions } from "./commands.ts";
 import type { RunRecord } from "./types.ts";
+import { renderDiff } from "./diff.ts";
+import { registerConversation, type ConversationContext, type ConversationHost } from "./conversation-extension.ts";
 
 /** Narrow structural contract: OMP injects the API; no second SDK runtime is imported. */
-interface CommandContext {
-  cwd: string;
-  model?: { provider: string; id: string };
-  agent?: { kind: "main" | "sub" };
-  ui: { notify(message: string, level?: "info" | "warning" | "error"): void };
-  setInterval(callback: () => void | Promise<void>, ms: number): unknown;
-  clearTimer(timer: unknown): void;
-}
-interface ExtensionHost {
+interface CommandContext extends ConversationContext {}
+interface ExtensionHost extends ConversationHost {
   registerCommand(name: string, command: { description: string; handler(args: string, context: CommandContext): Promise<void> }): void;
-  appendEntry(customType: string, data: unknown): void;
-  sendMessage(message: { customType: string; content: string; display: boolean }, options?: { triggerTurn?: boolean }): void;
 }
 
 export function runArguments(command: Extract<HarnessCommand, { kind: "run" }>, context: Pick<CommandContext, "model">): string[] {
@@ -48,21 +41,24 @@ async function cli(context: CommandContext, args: string[]): Promise<unknown> {
 
 export default function harnessExtension(pi: ExtensionHost): void {
   const watchers = new Map<string, { timer: unknown; context: CommandContext }>();
+  let sessionRevision = 0;
   const display = (text: string) => {
     const safe = safeDisplay(text);
     const content = safe.length <= 12_000 ? safe : `${safe.slice(0, 11_800)}\n\n[Display truncated. Use the corresponding CLI command to inspect the full result.]`;
-    pi.sendMessage({ customType: "omp-harness2.output", content, display: true }, { triggerTurn: false });
+    pi.sendMessage({ customType: "omp-harness2.output", content, display: true, attribution: "agent" }, { triggerTurn: false });
   };
 
   function watch(record: RunRecord, context: CommandContext): void {
     if (watchers.has(record.id)) return;
     const controller = new HarnessController({ workspace: context.cwd });
+    const revision = sessionRevision;
     let pending = false;
     const timer = context.setInterval(async () => {
       if (pending) return;
       pending = true;
       try {
         const current = await controller.get(record.id);
+        if (revision !== sessionRevision || !watchers.has(record.id)) return;
         if (!current || !["queued", "running"].includes(current.status)) {
           const watcher = watchers.get(record.id);
           if (watcher) watcher.context.clearTimer(watcher.timer);
@@ -73,6 +69,7 @@ export default function harnessExtension(pi: ExtensionHost): void {
           }
         }
       } catch (error) {
+        if (revision !== sessionRevision) return;
         const watcher = watchers.get(record.id);
         if (watcher) watcher.context.clearTimer(watcher.timer);
         watchers.delete(record.id);
@@ -82,15 +79,28 @@ export default function harnessExtension(pi: ExtensionHost): void {
     watchers.set(record.id, { timer, context });
   }
 
+  registerConversation(pi, {
+    controller: workspace => new HarnessController({ workspace }),
+    launch: async (context, record) => { await cli(context, ["resume-start", record.id]); },
+    renderDiff,
+    onSessionChange: () => {
+      sessionRevision++;
+      for (const watcher of watchers.values()) watcher.context.clearTimer(watcher.timer);
+      watchers.clear();
+    },
+  });
+
   pi.registerCommand("harness", {
     description: "Complete local tasks, compare useful approaches, review and apply results",
     async handler(args, context) {
+      const revision = sessionRevision;
       try {
         if (context.agent?.kind === "sub") throw new Error("Harness² control commands are available only in the main OMP session.");
         const command = parseCommandText(args);
         if (command.kind === "help") { display(HELP); return; }
         if (command.kind === "run" || command.kind === "resume") {
           const record = await cli(context, command.kind === "run" ? runArguments(command, context) : ["resume-start", command.id]) as RunRecord;
+          if (revision !== sessionRevision) return;
           pi.appendEntry("omp-harness2.run-started", { id: record.id, workspace: record.workspace, budgetUsd: record.config.maxCostUsd, mode: record.config.mode, strategy: record.config.strategy ?? "legacy" });
           context.ui.notify(`Harness² ${record.id} started. Budget $${record.config.maxCostUsd.toFixed(2)}. Use /harness status ${record.id}. Results require explicit apply.`, "info");
           watch(record, context);
@@ -122,6 +132,7 @@ export default function harnessExtension(pi: ExtensionHost): void {
           context.ui.notify(result.alreadyApplied ? "This result was already applied." : `Applied ${result.changes.length} file changes from ${command.id}.`, "info");
         }
       } catch (error) {
+        if (revision !== sessionRevision) return;
         context.ui.notify(`Harness²: ${safeDisplay(error instanceof Error ? error.message : String(error)).slice(0, 1000)}`, "error");
       }
     },
