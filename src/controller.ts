@@ -157,7 +157,8 @@ export class HarnessController {
       const adopted = record.stages[record.winner]!.harness!;
       try {
         await step("reflect", "reflector", record.baseHarness, reflectionPrompt(record, adopted));
-        record.lesson = parseLesson(record.stages.reflect!.result!.text, SOLVERS.filter(s => record.stages[s]?.status === "completed"));
+        record.lesson = parseLesson(record.stages.reflect!.result!.text,
+          ORDER.filter(s => s !== "reflect" && record.stages[s]?.status === "completed"));
       } catch (error) {
         if (abort.signal.aborted) throw error;
         delete record.lesson;

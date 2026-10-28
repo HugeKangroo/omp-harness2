@@ -185,7 +185,59 @@ describe("workspace host tools", () => {
     const data = JSON.parse((await tools.execute("list_files", { recursive: true })).content[0]!.text);
     expect(data.entries.map((entry: { path: string }) => entry.path)).toEqual(["src", "src/a.ts"]);
     expect(data.truncated).toBe(true);
+    expect(data.nextOffset).toBe(2);
     expect(data.skipped).toBe(1);
+    const last = JSON.parse((await tools.execute("list_files", { recursive: true, offset: data.nextOffset })).content[0]!.text);
+    expect(last.entries.map((entry: { path: string }) => entry.path)).toEqual(["src/b.ts"]);
+    expect(last.nextOffset).toBeNull();
+    expect(last.truncated).toBe(false);
+    expect(JSON.parse((await tools.execute("list_files", { recursive: true, offset: 3 })).content[0]!.text).entries).toEqual([]);
+  });
+
+  test("paginates long escaped paths within the RPC byte limit without omissions or duplicates", async () => {
+    const { workspace } = await fixture();
+    const parent = "a".repeat(200);
+    const nested = `${parent}/${"b".repeat(200)}`;
+    await mkdir(path.join(workspace, nested), { recursive: true });
+    const files = Array.from({ length: 1000 }, (_, index) => `${nested}/${String(index).padStart(4, "0")}${'"'.repeat(180)}`);
+    await Promise.all(files.map(file => writeFile(path.join(workspace, file), "")));
+    const tools = await createHostTools(workspace);
+    const listed: string[] = [];
+    let offset: number | null = 0;
+    let pages = 0;
+    while (offset !== null) {
+      const page = await tools.execute("list_files", { recursive: true, offset });
+      expect(page.isError).toBeUndefined();
+      const data = JSON.parse(page.content[0]!.text);
+      expect(page.details).toEqual(data);
+      expect(data.offset).toBe(offset);
+      expect(data.entries.length).toBeGreaterThan(0);
+      expect(data.entries.length).toBeLessThanOrEqual(1000);
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(256 * 1024);
+      const wire = { type: "host_tool_result", id: "tool-list", result: { content: page.content, details: page.details }, isError: false };
+      expect(Buffer.byteLength(JSON.stringify(wire)) + 1).toBeLessThan(1024 * 1024);
+      listed.push(...data.entries.map((entry: { path: string }) => entry.path));
+      expect(data.nextOffset).toBe(data.truncated ? offset + data.entries.length : null);
+      offset = data.nextOffset;
+      pages++;
+    }
+    expect(pages).toBeGreaterThan(1);
+    expect(listed).toEqual([parent, nested, ...files]);
+    expect(new Set(listed).size).toBe(listed.length);
+    const repeated = JSON.parse((await tools.execute("list_files", { recursive: true })).content[0]!.text);
+    expect(repeated.entries.map((entry: { path: string }) => entry.path)).toEqual(listed.slice(0, repeated.nextOffset));
+  }, 30000);
+
+  test("validates directory pagination offsets", async () => {
+    const { workspace } = await fixture();
+    await writeFile(path.join(workspace, "a"), "");
+    const tools = await createHostTools(workspace);
+    for (const offset of [-1, 0.5, "1", null, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, 2]) {
+      expect((await tools.execute("list_files", { offset })).isError).toBe(true);
+    }
+    const end = JSON.parse((await tools.execute("list_files", { offset: 1 })).content[0]!.text);
+    expect(end.entries).toEqual([]);
+    expect(end.nextOffset).toBeNull();
   });
 
   test("aborted and malformed calls make no writes; errors do not disclose absolute host paths", async () => {

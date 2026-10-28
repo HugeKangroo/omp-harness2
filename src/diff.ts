@@ -48,7 +48,11 @@ export function renderDiff(record: RunRecord, changes: Change[], maxCharacters =
     if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error(`Cannot render diff: ${safeDisplay(result.error?.message ?? result.stderr).slice(0, 500)}`);
     const a = JSON.stringify(`a/${change.path}`);
     const b = JSON.stringify(`b/${change.path}`);
+    let inHunk = false;
     const patch = result.stdout.split("\n").map((line) => {
+      if (line.startsWith("@@ ")) inHunk = true;
+      // Only metadata contains host paths. Hunk lines can also begin with --- or +++.
+      if (inHunk) return line;
       if (line.startsWith("diff --git ")) return `diff --git ${a} ${b}`;
       if (line.startsWith("--- ")) return `--- ${change.kind === "add" ? "/dev/null" : a}`;
       if (line.startsWith("+++ ")) return `+++ ${change.kind === "delete" ? "/dev/null" : b}`;

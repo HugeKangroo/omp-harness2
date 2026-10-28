@@ -95,6 +95,17 @@ describe("review diff", () => {
     expect(preview.length).toBeLessThan(400);
   }));
 
+  test("preserves header-looking source lines inside diff hunks", () => diffFixture((record, before, after) => {
+    writeFileSync(join(before, "counter.ts"), "-- count;\n-- old header\n");
+    writeFileSync(join(after, "counter.ts"), "++ count;\n++ new header\n");
+    const preview = renderDiff(record, [{ path: "counter.ts", kind: "modify" }]);
+    expect(preview).toContain('diff --git "a/counter.ts" "b/counter.ts"');
+    expect(preview).toContain('--- "a/counter.ts"\n+++ "b/counter.ts"\n');
+    expect(preview).toContain("@@ -1,2 +1,2 @@\n--- count;\n--- old header\n+++ count;\n+++ new header");
+    expect(preview).not.toContain(before);
+    expect(preview).not.toContain(after);
+  }));
+
   test("refuses path traversal and symlinks", () => diffFixture((record, before, after) => {
     writeFileSync(join(before, "source.txt"), "source\n");
     symlinkSync(join(before, "source.txt"), join(after, "source.txt"));

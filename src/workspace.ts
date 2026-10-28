@@ -7,6 +7,7 @@ import type { ApplyResult, Change, FileEntry, WorkspaceSnapshot } from "./types.
 /** These limits apply independently to the input and each candidate workspace. */
 export const WORKSPACE_LIMITS = { files: 20_000, fileBytes: 32 * 1024 * 1024, totalBytes: 256 * 1024 * 1024 };
 const ORIGIN = ".harness2-origin.json";
+const APPLY_LOCK = ".harness2/.apply.lock";
 const omittedDirectories = new Set([".git", ".harness2", ".harness-evidence", ".omp", ".pi", ".claude", ".codex", ".gemini", ".aws", ".ssh", ".gnupg", "node_modules", ".venv", "venv"]);
 const dependencyDirectories = new Set(["node_modules", ".venv", "venv"]);
 const ambientNames = new Set(["agents.md", "claude.md", "gemini.md", ORIGIN]);
@@ -218,6 +219,66 @@ function replace(root: string, relative: string, bytes: Buffer, mode: number): v
   try { fs.writeFileSync(fd, bytes); fs.fchmodSync(fd, mode); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   try { safePath(root, relative, true); fs.renameSync(temporary, target); } finally { fs.rmSync(temporary, { force: true }); }
 }
+interface ApplyLockOwner { pid: number; token: string; createdAt: string; sourceRoot: string }
+function readApplyLockOwner(source: string): ApplyLockOwner | undefined {
+  const directory = safePath(source, APPLY_LOCK);
+  if (!fs.lstatSync(directory).isDirectory()) throw new Error("Invalid workspace apply lock directory");
+  const file = safePath(source, `${APPLY_LOCK}/owner.json`, true);
+  const info = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!info) return undefined;
+  if (!info.isFile() || info.nlink !== 1 || info.size > 4096) throw new Error("Invalid workspace apply lock owner; manual inspection required");
+  let owner: ApplyLockOwner;
+  try { owner = JSON.parse(readFile(directory, "owner.json").bytes.toString("utf8")) as ApplyLockOwner; }
+  catch { throw new Error("Invalid workspace apply lock owner; manual inspection required"); }
+  if (!owner || typeof owner !== "object" || Array.isArray(owner) || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 ||
+      typeof owner.token !== "string" || !owner.token || typeof owner.createdAt !== "string" || !Number.isFinite(Date.parse(owner.createdAt)) || owner.sourceRoot !== source) {
+    throw new Error("Invalid workspace apply lock owner; manual inspection required");
+  }
+  return owner;
+}
+function applyOwnerIsAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+/** Serialize every transaction and recovery for this workspace, across run IDs and processes. */
+function acquireApplyLock(source: string): () => void {
+  fs.mkdirSync(safePath(source, ".harness2", true), { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const directory = safePath(source, APPLY_LOCK, true);
+    let created = false;
+    try { fs.mkdirSync(directory, { mode: 0o700 }); created = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    if (created) {
+      const owner: ApplyLockOwner = { pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString(), sourceRoot: source };
+      try { replace(directory, "owner.json", Buffer.from(JSON.stringify(owner)), 0o600); }
+      catch (error) { fs.rmSync(directory, { recursive: true, force: true }); throw error; }
+      return () => {
+        if (readApplyLockOwner(source)?.token !== owner.token) throw new Error("Workspace apply lock ownership changed; manual inspection required");
+        fs.rmSync(safePath(source, APPLY_LOCK), { recursive: true });
+      };
+    }
+    if (!fs.lstatSync(directory, { throwIfNoEntry: false })) continue;
+    const old = readApplyLockOwner(source);
+    if (!old) throw new Error("Workspace apply lock is initializing or its owner is missing; manual inspection required");
+    if (applyOwnerIsAlive(old.pid)) throw new Error(`Workspace apply is locked by active or unverified PID ${old.pid}`);
+    // Only one stale-owner reclaimer may inspect and remove this directory. A new
+    // owner can have acquired the path since our first read, so recheck its token.
+    const claim = safePath(source, `${APPLY_LOCK}/reclaim`, true);
+    try { fs.mkdirSync(claim, { mode: 0o700 }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Workspace apply lock reclamation is in progress or requires manual inspection");
+      throw error;
+    }
+    const current = readApplyLockOwner(source);
+    if (!current || current.token !== old.token || applyOwnerIsAlive(current.pid)) {
+      fs.rmSync(claim, { recursive: true, force: true });
+      throw new Error("Workspace apply lock changed during stale-owner check");
+    }
+    fs.rmSync(safePath(source, APPLY_LOCK), { recursive: true });
+  }
+  throw new Error("Could not acquire workspace apply lock");
+}
 interface Journal { sourceRoot: string; state: "prepared" | "applying" | "committed" | "rolled_back" | "rollback_failed"; changes: Change[]; before: (FileEntry | null)[] }
 function saveJournal(directory: string, journal: Journal): void { replace(directory, "journal.json", Buffer.from(JSON.stringify(journal, null, 2)), 0o600); }
 function rollback(source: string, directory: string, journal: Journal): void {
@@ -246,6 +307,11 @@ function rollback(source: string, directory: string, journal: Journal): void {
 /** Recover interrupted journaled applies, refusing to overwrite post-interruption edits. */
 export function recoverInterruptedApplies(sourceRoot: string): string[] {
   const source = rootDirectory(sourceRoot);
+  const release = acquireApplyLock(source);
+  try { return recoverInterruptedAppliesLocked(source); }
+  finally { release(); }
+}
+function recoverInterruptedAppliesLocked(source: string): string[] {
   const transactions = safePath(source, ".harness2/apply-transactions", true);
   if (!fs.existsSync(transactions)) return [];
   const recovered: string[] = [];
@@ -266,7 +332,12 @@ export function applyWorkspace(snapshot: WorkspaceSnapshot, candidateRoot: strin
   const source = rootDirectory(snapshot.sourceRoot);
   const candidate = rootDirectory(candidateRoot);
   if (source === candidate) throw new Error("Candidate must be separate from source workspace");
-  if (!options.dryRun) recoverInterruptedApplies(source);
+  const release = acquireApplyLock(source);
+  try { return applyWorkspaceLocked(snapshot, source, candidate, options); }
+  finally { release(); }
+}
+function applyWorkspaceLocked(snapshot: WorkspaceSnapshot, source: string, candidate: string, options: { dryRun?: boolean }): ApplyResult {
+  if (!options.dryRun) recoverInterruptedAppliesLocked(source);
   const changes = diffWorkspace(snapshot, candidate);
   const manifest = new Map(snapshot.files.map(f => [f.path, f]));
   const affected = new Set(changes.map(c => c.path));

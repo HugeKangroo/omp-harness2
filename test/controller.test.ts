@@ -24,6 +24,7 @@ class FakeRunner implements Runner {
   failOnce?: string;
   invalidEditors = false;
   reflect = true;
+  reflectionEvidence = ["baseline", "final"];
   cost = 0.01;
   async run(request: WorkerRequest): Promise<WorkerResult> {
     this.calls.push(request);
@@ -47,7 +48,7 @@ class FakeRunner implements Runner {
       const a = request.prompt.split("CANDIDATE A:\n")[1]!.split("CANDIDATE B:")[0]!;
       text = JSON.stringify({ winner: a.includes("Artifact for final") ? "A" : "B", reason: "The final artifact meets the task constraint." });
     } else {
-      text = this.reflect ? JSON.stringify({ cue: "Constrained local changes", lesson: "Specify an observable completion condition", evidence: ["baseline", "final"], confidence: "low", limitations: "One run; behavior is confounded." }) : '{"noEntry":true}';
+      text = this.reflect ? JSON.stringify({ cue: "Constrained local changes", lesson: "Specify an observable completion condition", evidence: this.reflectionEvidence, confidence: "low", limitations: "One run; behavior is confounded." }) : '{"noEntry":true}';
     }
     return { text, usage: { inputTokens: 10, outputTokens: 10, costUsd: this.cost }, startedAt, endedAt: new Date().toISOString(), eventsPath, status: "completed" };
   }
@@ -182,6 +183,35 @@ describe("durable Harness² controller", () => {
     expect(record.lesson).toBeUndefined();
     expect(await controller.library.list("project", "test/model")).toHaveLength(0);
     expect(await controller.diff(record.id)).toHaveLength(1);
+  });
+
+  test("reflection retains completed editor and selector evidence alongside execution evidence", async () => {
+    for (const mode of ["product", "research"] as const) {
+      const root = fixture(); const runner = new FakeRunner();
+      runner.reflectionEvidence = ["baseline", "final", "inv_edit", "dom_edit", "compose_edit", ...(mode === "product" ? ["select"] : [])];
+      const controller = new HarnessController({ workspace: root, runner });
+      const created = await controller.create("A task", { model: "test/model", mode });
+      const record = await controller.execute(created.id);
+      expect(record.status).toBe("completed");
+      expect(record.lesson?.evidence).toEqual(runner.reflectionEvidence);
+      expect(record.warnings).toBeUndefined();
+      const entries = await controller.library.list("project", "test/model");
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!.lesson.evidence).toEqual(runner.reflectionEvidence);
+    }
+  });
+
+  test("reflection still rejects evidence for stages that did not execute", async () => {
+    const root = fixture(); const runner = new FakeRunner();
+    runner.reflectionEvidence = ["baseline", "final", "select"];
+    const controller = new HarnessController({ workspace: root, runner });
+    const created = await controller.create("A task", { model: "test/model", mode: "research" });
+    const record = await controller.execute(created.id);
+    expect(record.status).toBe("completed");
+    expect(record.stages.select).toBeUndefined();
+    expect(record.lesson).toBeUndefined();
+    expect(record.warnings?.[0]).toContain("Reflection");
+    expect(await controller.library.list("project", "test/model")).toHaveLength(0);
   });
 
   test("partial preparation directories from a killed controller do not block recovery", async () => {

@@ -122,6 +122,8 @@ export async function createHostTools(workspace: string, options: HostToolOption
   const maxFileBytes = positiveLimit(options.maxFileBytes, DEFAULT_MAX_FILE_BYTES, 16 * 1024 * 1024);
   if (maxFileBytes < PAGE_METADATA_RESERVE * 2) throw new TypeError("maxFileBytes must be at least 2048 bytes to include pagination metadata.");
   const maxReadBytes = maxFileBytes - PAGE_METADATA_RESERVE;
+  // Leave ample room for the RPC envelope even when callers configure larger file pages.
+  const maxListBytes = Math.min(maxFileBytes, DEFAULT_MAX_FILE_BYTES);
   const maxEntries = positiveLimit(options.maxEntries, DEFAULT_MAX_ENTRIES, 100_000);
   const writable = options.writable === true;
   const virtualResources = new Map<string, Buffer>();
@@ -296,11 +298,15 @@ export async function createHostTools(workspace: string, options: HostToolOption
   async function listFiles(args: Record<string, unknown>, signal?: AbortSignal): Promise<HostToolResult> {
     const parts = relativeParts(args.path ?? ".", true);
     if (args.recursive !== undefined && typeof args.recursive !== "boolean") fail("recursive must be a boolean.");
+    const offset = args.offset === undefined ? 0 : args.offset;
+    if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) fail("offset must be a nonnegative integer entry offset.");
     const start = await directory(parts, false, signal);
     const entries: Array<{ path: string; type: "file" | "directory"; bytes?: number }> = [];
     const pending = [{ full: start, parts }];
     let skipped = 0;
     let truncated = false;
+    let visited = 0;
+    let responseBytes = PAGE_METADATA_RESERVE;
     while (pending.length) {
       checkSignal(signal);
       const next = pending.shift()!;
@@ -309,7 +315,6 @@ export async function createHostTools(workspace: string, options: HostToolOption
       for (const name of children) {
         checkSignal(signal);
         if (isProtected(name)) { skipped++; continue; }
-        if (entries.length >= maxEntries) { truncated = true; break; }
         const childParts = [...next.parts, name];
         // Filesystem names can contain backslashes and control characters even
         // though tool callers cannot address them. Keep them outside the surface.
@@ -321,22 +326,38 @@ export async function createHostTools(workspace: string, options: HostToolOption
           skipped++;
           continue;
         }
-        entries.push({ path: childParts.join("/"), type: info.isDirectory() ? "directory" : "file", ...(info.isFile() ? { bytes: info.size } : {}) });
+        const entry: typeof entries[number] = { path: childParts.join("/"), type: info.isDirectory() ? "directory" : "file", ...(info.isFile() ? { bytes: info.size } : {}) };
+        if (visited >= offset) {
+          if (entries.length >= maxEntries) { truncated = true; break; }
+          const encoded = JSON.stringify(entry);
+          // Entries appear both in details and inside the JSON text block. Count
+          // both encodings, including escaping and a conservative comma allowance.
+          const entryBytes = Buffer.byteLength(encoded) + Buffer.byteLength(JSON.stringify(encoded));
+          if (responseBytes + entryBytes > maxListBytes) {
+            if (!entries.length) fail("A directory entry exceeds the listing response budget.");
+            truncated = true;
+            break;
+          }
+          responseBytes += entryBytes;
+          entries.push(entry);
+        }
+        visited++;
         if (info.isDirectory() && args.recursive === true) pending.push({ full: child, parts: childParts });
       }
       if (truncated) break;
     }
     await assertRoot();
-    const data = { entries, skipped, truncated };
-    return result(JSON.stringify(data, null, 2), data);
+    if (offset > visited) fail("offset exceeds the directory listing size.");
+    const data = { entries, skipped, truncated, offset, nextOffset: truncated ? offset + entries.length : null };
+    return result(JSON.stringify(data), data);
   }
 
   const definitions: HostToolDefinition[] = [
     {
       name: "list_files",
       loadMode: "essential",
-      description: `List files in the private workspace, optionally recursively. Returns at most ${maxEntries} entries. Links, control directories and credential files are excluded.`,
-      parameters: { type: "object", properties: { path: { type: "string", description: 'Relative directory; "." means the workspace root.' }, recursive: { type: "boolean" } }, additionalProperties: false },
+      description: `List a page of files in the private workspace, optionally recursively. Uses sorted breadth-first order, at most ${maxEntries} entries and a ${maxListBytes}-byte total response budget. Follow nextOffset until null, keeping path and recursive unchanged; restart from offset 0 after workspace edits. Links, control directories and credential files are excluded.`,
+      parameters: { type: "object", properties: { path: { type: "string", description: 'Relative directory; "." means the workspace root.' }, recursive: { type: "boolean" }, offset: { type: "integer", minimum: 0, description: "Zero-based entry offset (default 0). Use nextOffset from the preceding page." } }, additionalProperties: false },
     },
     {
       name: "read_file",
@@ -362,7 +383,7 @@ export async function createHostTools(workspace: string, options: HostToolOption
           checkSignal(signal);
           if (name === "read_file") return await readFile(inputObject(args, ["path", "offset", "length"]), signal);
           if (name === "write_file") return await writeFile(inputObject(args, ["path", "content"]), signal);
-          if (name === "list_files") return await listFiles(inputObject(args, ["path", "recursive"]), signal);
+          if (name === "list_files") return await listFiles(inputObject(args, ["path", "recursive", "offset"]), signal);
           fail("Unknown host tool.");
         } catch (error) {
           const message = error instanceof ToolBoundaryError ? error.message

@@ -2,8 +2,9 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { applyWorkspace, captureSnapshot, diffWorkspace, materializeSnapshot, recoverInterruptedApplies, WORKSPACE_LIMITS } from "../src/workspace.js";
+import type { WorkspaceSnapshot } from "../src/types.ts";
 
 const temporary: string[] = [];
 afterEach(() => { for (const root of temporary.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -18,6 +19,27 @@ function fixture(): { root: string; source: string; snapshotRoot: string; candid
   const source = path.join(root, "source"); fs.mkdirSync(source); git(source, "init", "-q");
   put(source, "file.txt", "original"); git(source, "add", "file.txt");
   return { root, source, snapshotRoot: path.join(root, "snapshot"), candidate: path.join(root, "candidate") };
+}
+function pausedApply(root: string, snapshot: WorkspaceSnapshot, candidate: string) {
+  const request = path.join(root, "child-request.json"), paused = path.join(root, "child-paused"), proceed = path.join(root, "child-continue");
+  put(root, "child-request.json", JSON.stringify({ snapshot, candidate, pauseAfter: "file.txt", paused, proceed }));
+  const child = spawn(process.execPath, [path.join(import.meta.dir, "fixtures/apply-worker.ts"), request], { stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  child.stdout.on("data", value => { output += value; }); child.stderr.on("data", value => { output += value; });
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null; output: string }>((resolve, reject) => {
+    child.on("error", reject); child.on("close", (code, signal) => resolve({ code, signal, output }));
+  });
+  return {
+    child, exited,
+    resume: () => fs.writeFileSync(proceed, "continue"),
+    ready: async () => {
+      const deadline = Date.now() + 10_000;
+      while (!fs.existsSync(paused)) {
+        if (child.exitCode !== null || child.signalCode !== null || Date.now() >= deadline) throw new Error(`Apply child did not pause: ${output}`);
+        await Bun.sleep(10);
+      }
+    },
+  };
 }
 
 describe("workspace snapshots", () => {
@@ -77,6 +99,70 @@ describe("workspace snapshots", () => {
 });
 
 describe("workspace apply", () => {
+  test("concurrent processes cannot apply or recover another run's active transaction", async () => {
+    const f = fixture(); put(f.source, "b.txt", "old b"); put(f.source, "z.txt", "old z");
+    const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    const otherCandidate = path.join(f.root, "other-candidate"); materializeSnapshot(snapshot, otherCandidate);
+    put(f.candidate, "file.txt", "new first"); put(f.candidate, "z.txt", "new last"); put(otherCandidate, "b.txt", "other edit");
+    const worker = pausedApply(f.root, snapshot, f.candidate);
+    try {
+      await worker.ready();
+      expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("new first");
+      expect(() => applyWorkspace(snapshot, otherCandidate)).toThrow("locked");
+      expect(() => applyWorkspace(snapshot, otherCandidate, { dryRun: true })).toThrow("locked");
+      expect(() => recoverInterruptedApplies(f.source)).toThrow("locked");
+      expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("new first");
+      expect(fs.readFileSync(path.join(f.source, "b.txt"), "utf8")).toBe("old b");
+      expect(fs.readFileSync(path.join(f.source, "z.txt"), "utf8")).toBe("old z");
+      const lock = path.join(f.source, ".harness2/.apply.lock");
+      expect(fs.statSync(lock).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(path.join(lock, "owner.json")).mode & 0o777).toBe(0o600);
+    } finally { worker.resume(); await worker.exited; }
+    const result = await worker.exited;
+    expect(result.code).toBe(0); expect(JSON.parse(result.output).applied).toBe(true);
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("new first");
+    expect(fs.readFileSync(path.join(f.source, "z.txt"), "utf8")).toBe("new last");
+    expect(fs.existsSync(path.join(f.source, ".harness2/.apply.lock"))).toBe(false);
+    expect(recoverInterruptedApplies(f.source)).toEqual([]);
+    expect(() => applyWorkspace(snapshot, otherCandidate)).toThrow("drift");
+  }, 20_000);
+  test("a dead apply owner is reclaimed before recovering its interrupted transaction", async () => {
+    const f = fixture(); put(f.source, "z.txt", "old z");
+    const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
+    put(f.candidate, "file.txt", "new first"); put(f.candidate, "z.txt", "new last");
+    const worker = pausedApply(f.root, snapshot, f.candidate);
+    try { await worker.ready(); }
+    finally { worker.child.kill("SIGKILL"); await worker.exited; }
+    expect((await worker.exited).signal).toBe("SIGKILL");
+    expect(fs.existsSync(path.join(f.source, ".harness2/.apply.lock"))).toBe(true);
+    expect(recoverInterruptedApplies(f.source)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("original");
+    expect(fs.readFileSync(path.join(f.source, "z.txt"), "utf8")).toBe("old z");
+    expect(fs.existsSync(path.join(f.source, ".harness2/.apply.lock"))).toBe(false);
+    expect(applyWorkspace(snapshot, f.candidate).applied).toBe(true);
+  }, 20_000);
+  test("missing and malformed lock owners are preserved for inspection", () => {
+    const f = fixture(); const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate); put(f.candidate, "file.txt", "new");
+    const lock = path.join(f.source, ".harness2/.apply.lock"); fs.mkdirSync(lock, { recursive: true });
+    expect(() => recoverInterruptedApplies(f.source)).toThrow("owner is missing");
+    for (const contents of ["broken", JSON.stringify({ pid: process.pid, token: "owner", createdAt: "2026-01-01T00:00:00Z", sourceRoot: "/another-workspace" })]) {
+      put(lock, "owner.json", contents);
+      expect(() => applyWorkspace(snapshot, f.candidate)).toThrow("Invalid workspace apply lock owner");
+      expect(() => recoverInterruptedApplies(f.source)).toThrow("Invalid workspace apply lock owner");
+      expect(fs.readFileSync(path.join(lock, "owner.json"), "utf8")).toBe(contents);
+    }
+    expect(fs.readFileSync(path.join(f.source, "file.txt"), "utf8")).toBe("original");
+  });
+  test("lock directories and owner records cannot follow symlinks", () => {
+    const f = fixture(); const outside = path.join(f.root, "outside"); put(outside, "keep", "untouched");
+    const lock = path.join(f.source, ".harness2/.apply.lock"); fs.mkdirSync(path.dirname(lock));
+    fs.symlinkSync(outside, lock);
+    expect(() => recoverInterruptedApplies(f.source)).toThrow("Symlink");
+    fs.unlinkSync(lock); fs.mkdirSync(lock); fs.symlinkSync(path.join(outside, "keep"), path.join(lock, "owner.json"));
+    expect(() => recoverInterruptedApplies(f.source)).toThrow("Symlink");
+    expect(fs.readFileSync(path.join(outside, "keep"), "utf8")).toBe("untouched");
+    expect(fs.lstatSync(path.join(lock, "owner.json")).isSymbolicLink()).toBe(true);
+  });
   test("previews and applies add/modify/delete, preserves unrelated files, and is idempotent", () => {
     const f = fixture(); put(f.source, "delete.txt", "delete me");
     const snapshot = captureSnapshot(f.source, f.snapshotRoot); materializeSnapshot(snapshot, f.candidate);
